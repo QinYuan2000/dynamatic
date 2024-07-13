@@ -1808,5 +1808,216 @@ begin
         
 end architecture;
 
+--------------------------------------------------------------  Pipeline
+------------------------------------------------------------------------
+library ieee;
+use ieee.std_logic_1164.all;
+use ieee.numeric_std.all;
+USE work.customTypes.all;
+
+entity Pipeline is
+    generic(
+        INPUTS          : integer;
+        OUTPUTS         : integer;
+        DATA_SIZE_IN    : integer;
+        DATA_SIZE_OUT   : integer;
+        PIPELINE_DEPTH  : integer
+    );
+    port(
+        clk,rst         : in  std_logic;
+        dataInArray     : in  data_array(INPUTS - 1 downto 0)(DATA_SIZE_IN - 1 downto 0);
+        dataOutArray    : out data_array(0 downto 0)(DATA_SIZE_OUT - 1 downto 0);
+        pValidArray     : in  std_logic_vector(INPUTS - 1 downto 0);
+        nReadyArray     : in  std_logic_vector(0 downto 0);
+        validArray      : out std_logic_vector(0 downto 0);
+        readyArray      : out std_logic_vector(INPUTS - 1 downto 0)
+    );
+end Pipeline;
+
+architecture arch of Pipeline is
+    signal reg_en       : std_logic;
+    type PL_VALID_Memory is array (0 to PIPELINE_DEPTH - 1) of std_logic;
+    signal valid_reg    : PL_VALID_Memory;
+    type PIPELINE_Memory is array (0 to PIPELINE_DEPTH - 1) of STD_LOGIC_VECTOR (DATA_SIZE_IN-1 downto 0);
+    signal Memory       : PIPELINE_Memory;
+
+begin
+
+    valid_regs: process(clk, rst)
+    begin
+        if (rst = '1') then
+            for i in 0 to PIPELINE_DEPTH - 1 loop
+                valid_reg(i) <= '0';
+            end loop;
+        
+        elsif (rising_edge(clk)) then
+            if (reg_en) then
+                for i in 1 to PIPELINE_DEPTH - 1 loop
+                    valid_reg(i) <= valid_reg(i - 1);
+                end loop;
+                valid_reg(0) <= pValidArray(0);
+            end if;   
+        -- elsif (rising_edge(clk)) then
+        --     valid_reg(PIPELINE_DEPTH - 1) <= valid_reg(PIPELINE_DEPTH - 2) or not reg_en;
+        --     if (reg_en) then
+        --         for i in 1 to PIPELINE_DEPTH - 2 loop
+        --             valid_reg(i) <= valid_reg(i - 1);
+        --         end loop;
+        --         valid_reg(0) <= pValidArray(0);
+        --     end if;                
+      
+        end if;
+    end process; 
+
+    data_memory: process(clk)
+    begin
+        if (rising_edge(clk)) then
+            if (reg_en) then
+                for i in 1 to PIPELINE_DEPTH - 1 loop
+                    Memory(i) <= Memory(i - 1);
+                end loop;
+                    Memory(0) <= dataInArray(0);
+            end if;               
+        end if;
+    end process; 
+
+validArray(0) <= valid_reg(PIPELINE_DEPTH - 1);
+readyArray(0) <= not validArray(0) or nReadyArray(0);
+reg_en <= readyArray(0);
+dataOutArray(0) <= Memory(PIPELINE_DEPTH - 1);
+
+end arch;
+
+
+--------------------------------------------------------------  OB Chain
+------------------------------------------------------------------------
+library ieee;
+use ieee.std_logic_1164.all;
+use ieee.numeric_std.all;
+USE work.customTypes.all;
+
+entity OEHB_Chain is
+    generic(
+        INPUTS        : integer;
+        OUTPUTS       : integer;
+        DATA_SIZE_IN  : integer;
+        DATA_SIZE_OUT : integer;
+        OEHB_DEPTH    : integer -- Number of OEHB modules in the chain
+    );
+    port(
+        clk           : in std_logic;
+        rst           : in std_logic;
+        dataInArray   : in data_array(INPUTS - 1 downto 0)(DATA_SIZE_IN - 1 downto 0);
+        dataOutArray  : out data_array(0 downto 0)(DATA_SIZE_OUT - 1 downto 0);
+        pValidArray   : in std_logic_vector(INPUTS - 1 downto 0);
+        nReadyArray   : in std_logic_vector(0 downto 0);
+        validArray    : out std_logic_vector(0 downto 0);
+        readyArray    : out std_logic_vector(INPUTS - 1 downto 0)
+    );
+end OEHB_Chain;
+
+architecture arch of OEHB_Chain is
+    type OBchain_data is array (0 to OEHB_DEPTH) of std_logic_vector(DATA_SIZE_IN - 1 downto 0);
+    signal internalData    : OBchain_data;
+    type OBchain_signal is array (0 to OEHB_DEPTH) of std_logic;
+    signal internalValid   : OBchain_signal;
+    signal internalReady   : OBchain_signal;
+
+begin
+    internalData(0) <= dataInArray(0);
+    internalValid(0) <= pValidArray(0);
+    internalReady(OEHB_DEPTH) <= nReadyArray(0);
+
+    gen_OEHB: for i in 0 to OEHB_DEPTH - 1 generate
+        OEHB_inst: entity work.OEHB(arch)
+            generic map (
+                INPUTS => 1,
+                OUTPUTS => 1,
+                DATA_SIZE_IN => DATA_SIZE_IN,
+                DATA_SIZE_OUT => DATA_SIZE_OUT
+            )
+            port map (
+                clk => clk,
+                rst => rst,
+                dataInArray(0) => internalData(i),
+                dataOutArray(0) => internalData(i+1),
+                pValidArray(0) => internalValid(i),
+                nReadyArray(0) => internalReady(i+1),
+                validArray(0) => internalValid(i+1),
+                readyArray(0) => internalReady(i)
+            );
+    end generate gen_OEHB;
+
+    dataOutArray(0) <= internalData(OEHB_DEPTH);
+    validArray(0) <= internalValid(OEHB_DEPTH);
+    readyArray(0) <= internalReady(0);
+
+end arch;
+
+
+--------------------------------------------------------------  TB Chain
+------------------------------------------------------------------------
+library ieee;
+use ieee.std_logic_1164.all;
+use ieee.numeric_std.all;
+USE work.customTypes.all;
+
+entity TEHB_Chain is
+    generic(
+        INPUTS        : integer;
+        OUTPUTS       : integer;
+        DATA_SIZE_IN  : integer;
+        DATA_SIZE_OUT : integer;
+        TEHB_DEPTH    : integer -- Number of TEHB modules in the chain
+    );
+    port(
+        clk           : in std_logic;
+        rst           : in std_logic;
+        dataInArray   : in data_array(INPUTS - 1 downto 0)(DATA_SIZE_IN - 1 downto 0);
+        dataOutArray  : out data_array(0 downto 0)(DATA_SIZE_OUT - 1 downto 0);
+        pValidArray   : in std_logic_vector(INPUTS - 1 downto 0);
+        nReadyArray   : in std_logic_vector(0 downto 0);
+        validArray    : out std_logic_vector(0 downto 0);
+        readyArray    : out std_logic_vector(INPUTS - 1 downto 0)
+    );
+end TEHB_Chain;
+
+architecture arch of TEHB_Chain is
+    type TBchain_data is array (0 to TEHB_DEPTH) of std_logic_vector(DATA_SIZE_IN - 1 downto 0);
+    signal internalData    : TBchain_data;
+    type TBchain_signal is array (0 to TEHB_DEPTH) of std_logic;
+    signal internalValid   : TBchain_signal;
+    signal internalReady   : TBchain_signal;
+
+begin
+    internalData(0) <= dataInArray(0);
+    internalValid(0) <= pValidArray(0);
+    internalReady(TEHB_DEPTH) <= nReadyArray(0);
+
+    gen_TEHB: for i in 0 to TEHB_DEPTH - 1 generate
+        TEHB_inst: entity work.TEHB(arch)
+            generic map (
+                INPUTS => 1,
+                OUTPUTS => 1,
+                DATA_SIZE_IN => DATA_SIZE_IN,
+                DATA_SIZE_OUT => DATA_SIZE_OUT
+            )
+            port map (
+                clk => clk,
+                rst => rst,
+                dataInArray(0) => internalData(i),
+                dataOutArray(0) => internalData(i+1),
+                pValidArray(0) => internalValid(i),
+                nReadyArray(0) => internalReady(i+1),
+                validArray(0) => internalValid(i+1),
+                readyArray(0) => internalReady(i)
+            );
+    end generate gen_TEHB;
+
+    dataOutArray(0) <= internalData(TEHB_DEPTH);
+    validArray(0) <= internalValid(TEHB_DEPTH);
+    readyArray(0) <= internalReady(0);
+
+end arch;
 
 
