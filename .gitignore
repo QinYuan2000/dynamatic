@@ -39,3 +39,5 @@ build/
 bin/
 .cache/
 __pycache__/
+
+integration-test/
