@@ -88,9 +88,8 @@ protected:
 ///    properties
 /// 2. path constraints on all timing domains (including mixed-domain
 ///    connections within units)
-/// 3. elasticity constraints
-/// 4. throughput constraints for all CFDFCs that are part of the CFDFC union
-/// 5. a maximixation objective, that rewards high CFDFC throughputs and
+/// 3. throughput constraints for all CFDFCs that are part of the CFDFC union
+/// 4. a maximixation objective, that rewards high CFDFC throughputs and
 ///    penalizes the placement of many large buffers in the circuit
 class CFDFCUnionBuffers : public FPL22BuffersBase {
 public:
@@ -129,7 +128,6 @@ private:
 ///    properties
 /// 2. path constraints on all timing domains (including mixed-domain
 ///    connections within units)
-/// 3. elasticity constraints
 /// 5. a maximixation objective that penalizes the placement of many large
 ///    buffers in the circuit
 class OutOfCycleBuffers : public FPL22BuffersBase {

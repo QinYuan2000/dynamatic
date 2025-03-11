@@ -36,7 +36,7 @@ We abandon the use of the timing attribute to characterize `BufferOp` and instea
 
 The MILP result is remapped by decomposing the original `BufferOp` (previously expressed with the timing attribute) into a combination of `BufferOp`s of different types, each with its own slot number. This combination covers all cases previously expressed by the timing attribute and provides greater diversity in throughput and area characteristics. Since each buffer type corresponds one-to-one with an RTL HDL module, the Buffer Placement Pass and RTL backend require no additional smart conversion.
 
-For `FPGA20Buffers`, the remap is as follows:
+For `FPGA20Buffers` and `FPL22Buffers`, the remap is as follows:
 
 ```
 1. For Opaque Slots:
@@ -47,11 +47,7 @@ When numslot > 2, map to (numslot - 1) DVE buffers plus a 1-slot R buffer.
 2. For Transparent Slots:
 When numslot = 1, map to a 1-slot R buffer.
 When numslot > 1, map to a numslot-slot T buffer.
-```
 
-For `FPL22Buffers`, the remap is as follows:
+3.
 
-```
-Based on the FPGA20 mapping, if the R slot count exceeds 1, convert the additional slots beyond 1 into T buffers.
-Then, if both DV/DVE and T buffers are present, convert the T buffers into DVE buffers.
 ```

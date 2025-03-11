@@ -38,10 +38,9 @@ namespace fpga20 {
 /// 1. custom channel constraints derived from channel-specific buffering
 ///    properties
 /// 2. path constraints for all non-memory channels and units
-/// 3. elasticity constraints for all non-memory channels and units
-/// 4. throughput constraints for all channels and units parts of CFDFCs that
+/// 3. throughput constraints for all channels and units parts of CFDFCs that
 ///    were extracted from the function
-/// 5. a maximixation objective, that rewards high CFDFC throughputs and
+/// 4. a maximixation objective, that rewards high CFDFC throughputs and
 ///    penalizes the placement of many large buffers in the circuit
 class FPGA20Buffers : public BufferPlacementMILP {
 public:

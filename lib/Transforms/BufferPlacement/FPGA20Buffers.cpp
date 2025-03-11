@@ -89,20 +89,38 @@ void FPGA20Buffers::extractResult(BufferPlacement &placement) {
     // 2. For Transparent Slots:
     // When numslot = 1, map to a 1-slot R buffer.
     // When numslot > 1, map to a numslot-slot T buffer.
-    if (result.numSlotDV == 1){
-      result.numSlotDV = 1;
-    } else if (result.numSlotDV == 2){
-      result.numSlotDV = 1;
-      result.numSlotR = 1;
-    } else if (result.numSlotDV > 2){
-      result.numSlotDVE = result.numSlotDV - 1;
-      result.numSlotR = 1;
-      result.numSlotDV = 0;
-    }
-
-    if (result.numSlotR > 1){
-      result.numSlotT = result.numSlotR;
-      result.numSlotR = 0;
+    if (result.numSlotR == 0){
+      if (result.numSlotDV == 1){
+        // result.numSlotDVR = 1;
+        // result.numSlotDV = 0;
+        result.numSlotDV = 1;
+      } else if (result.numSlotDV == 2){
+        result.numSlotDV = 1;
+        result.numSlotR = 1;
+      } else if (result.numSlotDV > 2){
+        result.numSlotDVE = result.numSlotDV - 1;
+        result.numSlotR = 1;
+        result.numSlotDV = 0;
+      }
+    } else if (result.numSlotR == 1){
+      if (result.numSlotDV >= 2){
+        result.numSlotDVE = result.numSlotDV;
+        result.numSlotR = 1;
+        result.numSlotDV = 0;
+      }
+    } else if (result.numSlotR >= 2){
+      if (result.numSlotDV == 0){
+        result.numSlotT = result.numSlotR;
+        result.numSlotR = 0;
+      } else if (result.numSlotDV == 1){
+        result.numSlotDVE = result.numSlotDV + result.numSlotR;
+        result.numSlotR = 0;
+        result.numSlotDV = 0;
+      } else if (result.numSlotDV >= 2){
+        result.numSlotDVE = result.numSlotDV + result.numSlotR - 1;
+        result.numSlotR = 1;
+        result.numSlotDV = 0;
+      } 
     }
 
     placement[channel] = result;
@@ -112,7 +130,7 @@ void FPGA20Buffers::extractResult(BufferPlacement &placement) {
     logResults(placement);
 
   llvm::MapVector<size_t, double> cfdfcTPResult;
-  for (auto [idx, cfdfcWithVars] : llvm::enumerate(vars.cfVars)) {
+  for (auto [idx, cfdfcWithVars] : llvm::enumerate(vars.cfdfcVars)) {
     auto [cf, cfVars] = cfdfcWithVars;
     double tmpThroughput = cfVars.throughput.get(GRB_DoubleAttr_X);
 
@@ -129,6 +147,9 @@ void FPGA20Buffers::addCustomChannelConstraints(Value channel) {
   ChannelVars &chVars = vars.channelVars[channel];
   handshake::ChannelBufProps &props = channelProps[channel];
   GRBVar &dataBuf = chVars.signalVars[SignalType::DATA].bufPresent;
+  GRBVar &readyBuf = chVars.signalVars[SignalType::READY].bufPresent;
+
+  model.addConstr(dataBuf == readyBuf, "custom_data_ready_sync");
 
   if (props.minOpaque > 0) {
     // Force the MILP to use opaque slots
@@ -150,8 +171,6 @@ void FPGA20Buffers::addCustomChannelConstraints(Value channel) {
     model.addConstr(chVars.bufNumSlots >= props.minTrans + dataBuf,
                     "custom_minTrans");
   }
-  if (props.minOpaque + props.minTrans > 0)
-    model.addConstr(chVars.bufPresent == 1, "custom_forceBuffers");
 
   // Set a maximum number of slots to be placed
   if (props.maxOpaque.has_value()) {
@@ -174,18 +193,10 @@ void FPGA20Buffers::addCustomChannelConstraints(Value channel) {
 
 void FPGA20Buffers::setup() {
   // Signals for which we have variables
-  SmallVector<SignalType, 1> signals;
+  SmallVector<SignalType, 4> signals;
   signals.push_back(SignalType::DATA);
-
-  /// NOTE: (lucas-rami) For each buffering group this should be the timing
-  /// model of the buffer that will be inserted by the MILP for this group. We
-  /// don't have models for these buffers at the moment therefore we provide a
-  /// null-model to each group, but this hurts our placement's accuracy.
-  const TimingModel *bufModel = nullptr;
-
-  // Create buffering groups. In this MILP we only care for the data signal
-  SmallVector<BufferingGroup> bufGroups;
-  bufGroups.emplace_back(ArrayRef<SignalType>{SignalType::DATA}, bufModel);
+  signals.push_back(SignalType::VALID);
+  signals.push_back(SignalType::READY);
 
   // Create channel variables and constraints
   std::vector<Value> allChannels;
@@ -194,19 +205,20 @@ void FPGA20Buffers::setup() {
     addChannelVars(channel, signals);
     addCustomChannelConstraints(channel);
 
-    // Add path and elasticity constraints over all channels in the function
+    // Add timing constraints for all channels in the function
     // that are not adjacent to a memory interface
     if (!channel.getDefiningOp<handshake::MemoryOpInterface>() &&
         !isa<handshake::MemoryOpInterface>(*channel.getUsers().begin())) {
-      addChannelPathConstraints(channel, SignalType::DATA, bufModel);
-      addChannelElasticityConstraints(channel, bufGroups);
+      addSimpleBufferPresenceConstraints(channel, signals);
+      addTargetPeriodConstraints(channel, signals);
+      addSimpleChannelTimingConstraints(channel, signals);
+      addSignalLatencyConstraints(channel);
     }
   }
 
-  // Add path and elasticity constraints over all units in the function
+  // Add timing constraints for all units in the function
   for (Operation &op : funcInfo.funcOp.getOps()) {
-    addUnitPathConstraints(&op, SignalType::DATA);
-    addUnitElasticityConstraints(&op);
+    addUnitTimingConstraints(&op, SignalType::DATA);
   }
 
   // Create CFDFC variables and add throughput constraints for each CFDFC that
@@ -217,6 +229,8 @@ void FPGA20Buffers::setup() {
       continue;
     cfdfcs.push_back(cfdfc);
     addCFDFCVars(*cfdfc);
+    // Add throughput constraints on each CFDFC
+    addTokenDistributionConstraints(*cfdfc);
     addChannelThroughputConstraints(*cfdfc);
     addUnitThroughputConstraints(*cfdfc);
   }
