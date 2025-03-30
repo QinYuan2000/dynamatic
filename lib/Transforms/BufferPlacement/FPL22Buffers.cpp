@@ -80,54 +80,6 @@ void FPL22BuffersBase::extractResult(BufferPlacement &placement) {
       result.numSlotR = numSlotsToPlace;
     }
 
-    result.deductInternalBuffers(Channel(channel), timingDB);
-
-    // Remap to general buffer types.
-    // 1. For Opaque Slots:
-    // When numslot = 1, map to a 1-slot DV buffer.
-    // When numslot = 2, map to a 1-slot DV buffer plus a 1-slot R buffer.
-    // When numslot > 2, map to (numslot - 1) DVE buffers plus a 1-slot R buffer.
-    // 2. For Transparent Slots:
-    // When numslot = 1, map to a 1-slot R buffer.
-    // When numslot > 1, map to a numslot-slot T buffer.
-    // 3. After the two steps, if the R slot count exceeds 1, 
-    // convert the additional slots beyond 1 into T buffers.
-    // 4. Then, if both DV/DVE and T buffers are present, 
-    // convert the T buffers into DVE buffers.
-    if (result.numSlotR == 0){
-      if (result.numSlotDV == 1){
-        // result.numSlotDVR = 1;
-        // result.numSlotDV = 0;
-        result.numSlotDV = 1;
-      } else if (result.numSlotDV == 2){
-        result.numSlotDV = 1;
-        result.numSlotR = 1;
-      } else if (result.numSlotDV > 2){
-        result.numSlotDVE = result.numSlotDV - 1;
-        result.numSlotR = 1;
-        result.numSlotDV = 0;
-      }
-    } else if (result.numSlotR == 1){
-      if (result.numSlotDV >= 2){
-        result.numSlotDVE = result.numSlotDV;
-        result.numSlotR = 1;
-        result.numSlotDV = 0;
-      }
-    } else if (result.numSlotR >= 2){
-      if (result.numSlotDV == 0){
-        result.numSlotT = result.numSlotR;
-        result.numSlotR = 0;
-      } else if (result.numSlotDV == 1){
-        result.numSlotDVE = result.numSlotDV + result.numSlotR;
-        result.numSlotR = 0;
-        result.numSlotDV = 0;
-      } else if (result.numSlotDV >= 2){
-        result.numSlotDVE = result.numSlotDV + result.numSlotR - 1;
-        result.numSlotR = 1;
-        result.numSlotDV = 0;
-      } 
-    }
-    
     placement[channel] = result;
   }
 

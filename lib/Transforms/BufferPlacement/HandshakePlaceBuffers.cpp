@@ -535,10 +535,7 @@ LogicalResult HandshakePlaceBuffersPass::placeWithoutUsingMILP() {
     // buffers at the same time
     BufferPlacement placement;
     for (auto &[channel, props] : channelProps) {
-      PlacementResult result;  
-      result.numSlotDV = props.minOpaque;  
-      result.numSlotR  = props.minTrans;  
-      result.deductInternalBuffers(Channel(channel), timingDB);
+      PlacementResult result{props.minTrans, props.minOpaque};
       placement[channel] = result;
     }
     instantiateBuffers(placement);
