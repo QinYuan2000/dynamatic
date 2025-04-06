@@ -200,7 +200,7 @@ void BufferPlacementMILP::addSimpleBufferPresenceConstraints(
     GRBVar &bufPresent = signalVars.bufPresent;
     GRBVar &latency = signalVars.latency;
     
-    // There is a buffer present on a signal iff latency = 1 (both are binary)
+    // There is a buffer present on a signal iff latency = 1
     model.addConstr(bufPresent == latency, 
                     getSignalName(sig).str() + "_buffered_if_latency");
     // If there is a buffer present on a signal, then there is a buffer present
@@ -210,6 +210,7 @@ void BufferPlacementMILP::addSimpleBufferPresenceConstraints(
   }
 
   // There is a buffer iff there is at least one slot
+  // Assume there are at most 100 slots on the channel
   model.addConstr(0.01 * chVars.bufNumSlots <= chVars.bufPresent, "buffer_present");
   model.addConstr(chVars.bufNumSlots >= chVars.bufPresent, "buffer_positive_slotNum");
 }
@@ -236,7 +237,6 @@ void BufferPlacementMILP::addSimpleChannelTimingConstraints(
   ChannelVars &chVars = vars.channelVars[channel];
   
   for (SignalType sig : signals) {
-      
     ChannelSignalVars &signalVars = chVars.signalVars[sig];
     GRBVar &bufPresent = signalVars.bufPresent;
     GRBVar &tIn = signalVars.path.tIn;
