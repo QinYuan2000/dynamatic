@@ -170,9 +170,15 @@ protected:
   void addCFDFCVars(CFDFC &cfdfc);
 
   /// Adds buffer presence constraints for the provided signals on the channel. 
-  /// These ensure buffer presence variables are properly linked with signal 
+  /// These ensure buffer presence variables are properly linked with signal
   /// latency and channel buffer presence.
+  ///
+  /// Choose only one function between 'addSimpleBufferPresenceConstraints'
+  /// and 'addGeneralBufferPresenceConstraints'.
+  /// The first one assumes the signal latency can be at most one, while the 
+  /// second one assumes the signal latency can be any non-negative integer.
   void addSimpleBufferPresenceConstraints(Value channel, ArrayRef<SignalType> signals);
+  void addGeneralBufferPresenceConstraints(Value channel, ArrayRef<SignalType> signals);
   
   /// Adds constraints that ensure the arrival times at both ends of the 
   /// channel are less than or equal to the target clock period.
@@ -223,7 +229,14 @@ protected:
   ///
   /// It is only valid to call this method after having added variables for the
   /// CFDFC to the model.
-  void addChannelThroughputConstraints(CFDFC &cfdfc);
+  ///
+  /// Choose only one function between 'addSimpleChannelThroughputConstraints'
+  /// and 'addGeneralChannelThroughputConstraints'.
+  /// The first one assumes the channel throughput can be at most one, while
+  /// the second one assumes the channel throughput can be any non-negative
+  /// integer.
+  void addSimpleChannelThroughputConstraints(CFDFC &cfdfc);
+  void addGeneralChannelThroughputConstraints(CFDFC &cfdfc);
   
   /// Adds throughput constraints for all pipelined units in the CFDFC. These
   /// ensure that pipelined units have appropriate token retiming to maintain 

@@ -211,9 +211,38 @@ void BufferPlacementMILP::addSimpleBufferPresenceConstraints(
 
   // There is a buffer iff there is at least one slot
   // Assume there are at most 100 slots on the channel
-  model.addConstr(0.01 * chVars.bufNumSlots <= chVars.bufPresent, "buffer_present");
+  model.addConstr(chVars.bufNumSlots <= 100 * chVars.bufPresent, "buffer_present");
   model.addConstr(chVars.bufNumSlots >= chVars.bufPresent, "buffer_positive_slotNum");
 }
+
+void BufferPlacementMILP::addGeneralBufferPresenceConstraints(
+    Value channel, ArrayRef<SignalType> signals) {
+  
+  ChannelVars &chVars = vars.channelVars[channel];
+  
+  for (SignalType sig : signals) {
+    ChannelSignalVars &signalVars = chVars.signalVars[sig];
+    GRBVar &bufPresent = signalVars.bufPresent;
+    GRBVar &latency = signalVars.latency;
+    
+    // There is a buffer present on a signal iff latency >= 1
+    // Assume there are at most 100 slots on the channel
+    model.addConstr(latency >= bufPresent, 
+                              getSignalName(sig).str() + "_latency_ge_buf");
+    model.addConstr(latency <= 100 * bufPresent, 
+                              getSignalName(sig).str() + "_latency_le_buf_scaled");
+    // If there is a buffer present on a signal, then there is a buffer present
+    // on the channel
+    model.addConstr(bufPresent <= chVars.bufPresent,
+                    "buffer_presence_on_" + getSignalName(sig).str());
+  }
+
+  // There is a buffer iff there is at least one slot
+  // Assume there are at most 100 slots on the channel
+  model.addConstr(chVars.bufNumSlots <= 100 * chVars.bufPresent, "buffer_present");
+  model.addConstr(chVars.bufNumSlots >= chVars.bufPresent, "buffer_positive_slotNum");
+}
+
 
 void BufferPlacementMILP::addTargetPeriodConstraints(
     Value channel, ArrayRef<SignalType> signals) {
@@ -425,7 +454,7 @@ void BufferPlacementMILP::addTokenDistributionConstraints(CFDFC &cfdfc) {
   }
 }
 
-void BufferPlacementMILP::addChannelThroughputConstraints(CFDFC &cfdfc) {
+void BufferPlacementMILP::addSimpleChannelThroughputConstraints(CFDFC &cfdfc) {
   CFDFCVars &cfVars = vars.cfdfcVars[&cfdfc];
   
   for (Value channel : cfdfc.channels) {
@@ -448,6 +477,33 @@ void BufferPlacementMILP::addChannelThroughputConstraints(CFDFC &cfdfc) {
                               "throughput_tokens");
     model.addConstr(cfVars.throughput <= channelBubble - 
                               signalVars[SignalType::READY].latency + 1, 
+                              "throughput_bubbles");
+    model.addConstr(channelToken + channelBubble <= bufNumSlots, 
+                  "tokens_bubbles_numSlots");
+  }
+}
+
+void BufferPlacementMILP::addGeneralChannelThroughputConstraints(CFDFC &cfdfc) {
+  CFDFCVars &cfVars = vars.cfdfcVars[&cfdfc];
+  
+  for (Value channel : cfdfc.channels) {
+    Operation *dstOp = *channel.getUsers().begin();
+
+    if (isa<handshake::StoreOp>(dstOp))
+      continue;
+    if (auto selOp = dyn_cast<handshake::SelectOp>(dstOp))
+      if (channel == selOp.getTrueValue())
+        continue;
+    
+    ChannelVars &chVars = vars.channelVars[channel];
+    auto &signalVars = chVars.signalVars;
+    GRBVar &bufNumSlots = chVars.bufNumSlots;
+    GRBVar &channelToken = cfVars.tokenOccupancy[channel];
+    GRBVar &channelBubble = cfVars.bubbleOccupancy[channel];
+    
+    model.addConstr(signalVars[SignalType::VALID].latency * cfVars.throughput <= channelToken, 
+                              "throughput_tokens");
+    model.addConstr(signalVars[SignalType::READY].latency * cfVars.throughput <= channelBubble, 
                               "throughput_bubbles");
     model.addConstr(channelToken + channelBubble <= bufNumSlots, 
                   "tokens_bubbles_numSlots");
