@@ -211,7 +211,7 @@ void BufferPlacementMILP::addSimpleBufferPresenceConstraints(
 
   // There is a buffer iff there is at least one slot
   // Assume there are at most 100 slots on the channel
-  model.addConstr(0.01 * chVars.bufNumSlots <= chVars.bufPresent, "buffer_present");
+  model.addConstr(chVars.bufNumSlots <= 100 * chVars.bufPresent, "buffer_present");
   model.addConstr(chVars.bufNumSlots >= chVars.bufPresent, "buffer_positive_slotNum");
 }
 
