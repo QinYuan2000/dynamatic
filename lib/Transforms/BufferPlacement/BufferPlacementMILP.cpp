@@ -137,6 +137,7 @@ void BufferPlacementMILP::addChannelVars(Value channel,
   // Variables for placement information
   chVars.bufPresent = createVar("channelBufPresent", GRB_BINARY);
   chVars.bufNumSlots = createVar("bufNumSlots", GRB_INTEGER);
+  chVars.shiftReg = createVar("shiftReg", GRB_BINARY);
 
   // Update the model before returning so that these variables can be referenced
   // safely during the rest of model creation
@@ -225,12 +226,22 @@ void BufferPlacementMILP::addGeneralBufferPresenceConstraints(
     GRBVar &bufPresent = signalVars.bufPresent;
     GRBVar &latency = signalVars.latency;
     
-    // There is a buffer present on a signal iff latency >= 1
-    // Assume there are at most 100 slots on the channel
-    model.addConstr(latency >= bufPresent, 
-                              getSignalName(sig).str() + "_latency_ge_buf");
-    model.addConstr(latency <= 100 * bufPresent, 
-                              getSignalName(sig).str() + "_latency_le_buf_scaled");
+    if (sig == SignalType::Ready){
+      // There is a buffer present on a signal iff latency >= 1, READY latency is
+      // at most 1 because higher values will not improve the model performance.
+      model.addConstr(bufPresent == latency, 
+                      getSignalName(sig).str() + "_buffered_if_latency");
+    } else {
+      // There is a buffer present on a signal iff latency >= 1
+      // Assume there are at most 100 slots on the channel
+      model.addConstr(latency >= bufPresent, 
+                                getSignalName(sig).str() + "_latency_ge_buf");
+      model.addConstr(latency <= 100 * bufPresent, 
+                                getSignalName(sig).str() + "_latency_le_buf_scaled");
+    }
+    // The latency does not exceed the number of buffer slots.
+    model.addConstr(latency <= chVars.bufNumSlots, 
+                              getSignalName(sig).str() + "_latency_le_bufSlots");
     // If there is a buffer present on a signal, then there is a buffer present
     // on the channel
     model.addConstr(bufPresent <= chVars.bufPresent,
@@ -241,6 +252,11 @@ void BufferPlacementMILP::addGeneralBufferPresenceConstraints(
   // Assume there are at most 100 slots on the channel
   model.addConstr(chVars.bufNumSlots <= 100 * chVars.bufPresent, "buffer_present");
   model.addConstr(chVars.bufNumSlots >= chVars.bufPresent, "buffer_positive_slotNum");
+  // Shift registers only introduce valid (and data) latency.
+  // If shift registers are used, there must be enough slots for them.
+  model.addConstr(chVars.signalVars[SignalType::VALID].bufPresent + 
+                  chVars.signalVars[SignalType::READY].bufPresent <=
+                  chVars.bufNumSlots + 100 * (1 - chVars.shiftReg), "enough_slots_for_shiftReg");
 }
 
 
@@ -483,7 +499,7 @@ void BufferPlacementMILP::addSimpleChannelThroughputConstraints(CFDFC &cfdfc) {
   }
 }
 
-void BufferPlacementMILP::addGeneralChannelThroughputConstraints(CFDFC &cfdfc) {
+void BufferPlacementMILP::addQuadraticChannelThroughputConstraints(CFDFC &cfdfc) {
   CFDFCVars &cfVars = vars.cfdfcVars[&cfdfc];
   
   for (Value channel : cfdfc.channels) {
@@ -498,15 +514,25 @@ void BufferPlacementMILP::addGeneralChannelThroughputConstraints(CFDFC &cfdfc) {
     ChannelVars &chVars = vars.channelVars[channel];
     auto &signalVars = chVars.signalVars;
     GRBVar &bufNumSlots = chVars.bufNumSlots;
+    GRBVar &shiftReg = chVars.shiftReg;
     GRBVar &channelToken = cfVars.tokenOccupancy[channel];
     GRBVar &channelBubble = cfVars.bubbleOccupancy[channel];
+    GRBVar &validLatency = signalVars[SignalType::VALID].latency;
+    GRBVar &readyLatency = signalVars[SignalType::READY].latency;
+    GRBVar &throughput = cfVars.throughput;
     
-    model.addConstr(signalVars[SignalType::VALID].latency * cfVars.throughput <= channelToken, 
-                              "throughput_tokens");
-    model.addConstr(signalVars[SignalType::READY].latency * cfVars.throughput <= channelBubble, 
-                              "throughput_bubbles");
+    // Set a ceiling funciton for the extra bubble component introduced by the shift register.
+    std::string channelName = getUniqueName(*channel.getUses().begin());
+    std::string extraBubbleVarName = "extra_bubble_" + channelName;
+    GRBVar extraBubble = model.addVar(0, GRB_INFINITY, 0.0, GRB_INTEGER, extraBubbleVarName);
+    std::string extraBubbleConstrName = "extra_bubble_constr_" + channelName;
+    model.addQConstr(extraBubble <= validLatency * throughput + 0.99, extraBubbleConstrName);
+    model.addQConstr(validLatency * throughput <= channelToken, 
+                                        "throughput_tokens");
+    model.addQConstr(readyLatency * throughput + shiftReg * (validLatency - extraBubble)
+                                        <= channelBubble, "throughput_bubbles");
     model.addConstr(channelToken + channelBubble <= bufNumSlots, 
-                  "tokens_bubbles_numSlots");
+                                        "tokens_bubbles_numSlots");
   }
 }
 
@@ -547,7 +573,7 @@ unsigned BufferPlacementMILP::getChannelNumExecs(Value channel) {
   return numExec;
 }
 
-void BufferPlacementMILP::addObjective(ValueRange channels,
+void BufferPlacementMILP::addMaxThroughputObjective(ValueRange channels,
                                        ArrayRef<CFDFC *> cfdfcs) {
   // Compute the total number of executions over channels that are part of any
   // CFDFC
@@ -585,6 +611,65 @@ void BufferPlacementMILP::addObjective(ValueRange channels,
     ChannelVars &channelVars = vars.channelVars[channel];
     objective -= maxCoefCFDFC * bufPenaltyMul * channelVars.bufPresent;
     objective -= maxCoefCFDFC * slotPenaltyMul * channelVars.bufNumSlots;
+
+    handshake::ChannelBufProps &props = channelProps[channel];
+    if (props.minSlots > 0){
+      objective -= maxCoefCFDFC * DVPenaltyMul * channelVars.signalVars[SignalType::DATA].bufPresent;
+    }
+  }
+
+  // Finally, set the MILP objective
+  model.setObjective(objective, GRB_MAXIMIZE);
+}
+
+void BufferPlacementMILP::addCostAwareObjective(ValueRange channels,
+                                       ArrayRef<CFDFC *> cfdfcs) {
+  // Compute the total number of executions over channels that are part of any
+  // CFDFC
+  unsigned totalExecs = 0;
+  for (Value channel : channels) {
+    totalExecs += getChannelNumExecs(channel);
+  }
+
+  // Create the expression for the MILP objective
+  GRBQuadExpr objective;
+
+  // For each CFDFC, add a throughput contribution to the objective, weighted
+  // by the "importance" of the CFDFC
+  double maxCoefCFDFC = 0.0;
+  double fTotalExecs = static_cast<double>(totalExecs);
+  if (totalExecs != 0) {
+    for (CFDFC *cfdfc : cfdfcs) {
+      double coef = (cfdfc->channels.size() * cfdfc->numExecs) / fTotalExecs;
+      objective += coef * vars.cfdfcVars[cfdfc].throughput;
+      maxCoefCFDFC = std::max(coef, maxCoefCFDFC);
+    }
+  }
+
+  // In case we ran the MILP without providing any CFDFC, set the maximum CFDFC
+  // coefficient to any positive value
+  if (maxCoefCFDFC == 0.0)
+    maxCoefCFDFC = 1.0;
+
+  // For each channel, add a "penalty" in case a buffer is added to the channel,
+  // and another penalty that depends on the number of slots
+  double bufPenaltyMul = 1e-4;
+  double largeSlotPenaltyMul = 1e-4;
+  double smallSlotPenaltyMul = 1e-5;
+  double shiftRegPenaltyMul = 1e-5;
+  double shiftRegSlotPenaltyMul = 1e-7;
+  double DVPenaltyMul = 3e-4;
+  for (Value channel : channels) {
+    ChannelVars &channelVars = vars.channelVars[channel];
+    GRBVar &bufPresent = channelVars.bufPresent;
+    GRBVar &bufNumSlots = channelVars.bufNumSlots;
+    GRBVar &shiftReg = channelVars.shiftReg;
+    GRBVar &latencyV = channelVars.signalVars[SignalType::VALID].latency;
+    objective -= maxCoefCFDFC * bufPenaltyMul * bufPresent;
+    objective -= maxCoefCFDFC * largeslotPenaltyMul * (bufNumSlots - latencyV);
+    objective -= maxCoefCFDFC * smallSlotPenaltyMul * latencyV * (1 - shiftReg);
+    objective -= maxCoefCFDFC * shiftRegPenaltyMul * shiftReg;
+    objective -= maxCoefCFDFC * shiftRegSlotPenaltyMul * latencyV * shiftReg;
 
     handshake::ChannelBufProps &props = channelProps[channel];
     if (props.minSlots > 0){

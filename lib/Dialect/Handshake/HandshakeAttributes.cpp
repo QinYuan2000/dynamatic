@@ -228,13 +228,6 @@ TimingInfo TimingInfo::tehb() {
       .setLatency(SignalType::READY, 1);
 }
 
-TimingInfo TimingInfo::fifo_break_dv() {
-  return TimingInfo()
-      .setLatency(SignalType::DATA, 1)
-      .setLatency(SignalType::VALID, 1)
-      .setLatency(SignalType::READY, 0);
-}
-
 TimingInfo TimingInfo::fifo_break_none() {
   return TimingInfo()
       .setLatency(SignalType::DATA, 0)

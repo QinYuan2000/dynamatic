@@ -84,7 +84,7 @@ struct HandshakePlaceBuffersCustomPass
       timing = handshake::TimingInfo::tehb();
       bufferType = handshake::BufferOp::ONE_SLOT_BREAK_R;
     } else if (type == "fifo_break_dv") {
-      timing = handshake::TimingInfo::fifo_break_dv();
+      timing = handshake::TimingInfo::oehb();
       bufferType = handshake::BufferOp::FIFO_BREAK_DV;
     } else if (type == "fifo_break_none") {
       timing = handshake::TimingInfo::fifo_break_none();
@@ -92,6 +92,9 @@ struct HandshakePlaceBuffersCustomPass
     } else if (type == "one_slot_break_dvr") {
       timing = handshake::TimingInfo::one_slot_break_dvr();
       bufferType = handshake::BufferOp::ONE_SLOT_BREAK_DVR;
+    } else if (type == "shift_reg_break_dv") {
+      timing = handshake::TimingInfo::oehb();
+      bufferType = handshake::BufferOp::SHIFT_REG_BREAK_DV;
     } else {
       llvm::errs() << "Unknown buffer type: \"" << type << "\"!\n";
       return signalPassFailure();

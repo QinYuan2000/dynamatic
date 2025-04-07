@@ -74,6 +74,8 @@ struct ChannelVars {
   GRBVar bufPresent;
   /// Number of buffer slots on the channel (integer).
   GRBVar bufNumSlots;
+  /// Usage of a shift register on the channel (binary).
+  GRBVar shiftReg;
 };
 
 /// Holds all variables associated to a CFDFC. These are a set of variables for
@@ -231,12 +233,12 @@ protected:
   /// CFDFC to the model.
   ///
   /// Choose only one function between 'addSimpleChannelThroughputConstraints'
-  /// and 'addGeneralChannelThroughputConstraints'.
+  /// and 'addQuadraticChannelThroughputConstraints'.
   /// The first one assumes the channel throughput can be at most one, while
   /// the second one assumes the channel throughput can be any non-negative
   /// integer.
   void addSimpleChannelThroughputConstraints(CFDFC &cfdfc);
-  void addGeneralChannelThroughputConstraints(CFDFC &cfdfc);
+  void addQuadraticChannelThroughputConstraints(CFDFC &cfdfc);
   
   /// Adds throughput constraints for all pipelined units in the CFDFC. These
   /// ensure that pipelined units have appropriate token retiming to maintain 
@@ -257,7 +259,14 @@ protected:
   /// using an estimation of the transfer frequency over each provided channel.
   /// The objective has a negative term for each buffer placement decision and
   /// for each buffer slot placed on any of the provide channels.
-  void addObjective(ValueRange channels, ArrayRef<CFDFC *> cfdfcs);
+  ///
+  /// Choose only one function between 'addMaxThroughputObjective' and
+  /// 'addCostAwareObjective'.
+  /// The first one counts the buffer presence and buffer slot number as a cost, 
+  /// while the second one discriminates the buffer type and counts the cost
+  /// accordingly.
+  void addMaxThroughputObjective(ValueRange channels, ArrayRef<CFDFC *> cfdfcs);
+  void addCostAwareObjective(ValueRange channels, ArrayRef<CFDFC *> cfdfcs);
 
   /// Helper method to run a callback function on each input/output port pair of
   /// the provided operation, unless one of the ports has `mlir::MemRefType`.

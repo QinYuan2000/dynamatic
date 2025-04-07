@@ -61,9 +61,9 @@ void FPL22BuffersBase::extractResult(BufferPlacement &placement) {
     // When numslot = 1, map to ONE_SLOT_BREAK_R;
     // When numslot > 1, map to numslot * FIFO_BREAK_NONE.
     if (forceBreakDV && forceBreakR) {
-      if (numSlotsToPlace == 1){
+      if (numSlotsToPlace == 1) {
         result.numOneSlotDV = 1;
-      } else if (numSlotsToPlace == 2){
+      } else if (numSlotsToPlace == 2) {
         result.numOneSlotDV = 1;
         result.numOneSlotR = 1;
       } else {
@@ -71,13 +71,13 @@ void FPL22BuffersBase::extractResult(BufferPlacement &placement) {
         result.numOneSlotR = 1;
       }
     } else if (forceBreakDV) {
-      if (numSlotsToPlace == 1){
+      if (numSlotsToPlace == 1) {
         result.numOneSlotDV = 1;
       } else {
         result.numFifoNone = numSlotsToPlace;
       }
     } else {
-      if (numSlotsToPlace == 1){
+      if (numSlotsToPlace == 1) {
         result.numOneSlotR = 1;
       } else {
         result.numFifoNone = numSlotsToPlace;
@@ -366,14 +366,14 @@ void CFDFCUnionBuffers::setup() {
       continue;
     addCFDFCVars(*cfdfc);
     addTokenDistributionConstraints(*cfdfc);
-    addChannelThroughputConstraints(*cfdfc);
+    addSimpleChannelThroughputConstraints(*cfdfc);
     addUnitThroughputConstraints(*cfdfc);
   }
 
   // Add the MILP objective and mark the MILP ready to be optimized
   std::vector<Value> allChannels;
   llvm::copy(cfUnion.channels, std::back_inserter(allChannels));
-  addObjective(allChannels, cfUnion.cfdfcs);
+  addMaxThroughputObjective(allChannels, cfUnion.cfdfcs);
   markReadyToOptimize();
 }
 

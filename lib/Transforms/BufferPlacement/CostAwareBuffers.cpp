@@ -1,4 +1,4 @@
-//===- FPGA20Buffers.cpp - FPGA'20 buffer placement -------------*- C++ -*-===//
+//===- CostAwareBuffers.cpp - Cost-aware buffer placement -------*- C++ -*-===//
 //
 // Dynamatic is under the Apache License v2.0 with LLVM Exceptions.
 // See https://llvm.org/LICENSE.txt for license information.
@@ -6,14 +6,12 @@
 //
 //===----------------------------------------------------------------------===//
 //
-// Implements FPGA'20 smart buffer placement.
+// Implements cost-aware smart buffer placement.
 //
 //===----------------------------------------------------------------------===//
 
-#include "dynamatic/Transforms/BufferPlacement/FPGA20Buffers.h"
+#include "dynamatic/Transforms/BufferPlacement/CostAwareBuffers.h"
 #include "dynamatic/Dialect/Handshake/HandshakeOps.h"
-#include "dynamatic/Support/Attribute.h"
-#include "dynamatic/Support/CFG.h"
 #include "dynamatic/Support/TimingModels.h"
 #include "dynamatic/Transforms/BufferPlacement/BufferingSupport.h"
 #include "mlir/IR/Value.h"
@@ -25,9 +23,9 @@ using namespace llvm::sys;
 using namespace mlir;
 using namespace dynamatic;
 using namespace dynamatic::buffer;
-using namespace dynamatic::buffer::fpga20;
+using namespace dynamatic::buffer::costaware;
 
-FPGA20Buffers::FPGA20Buffers(GRBEnv &env, FuncInfo &funcInfo,
+CostAwareBuffers::CostAwareBuffers(GRBEnv &env, FuncInfo &funcInfo,
                              const TimingDatabase &timingDB,
                              double targetPeriod)
     : BufferPlacementMILP(env, funcInfo, timingDB, targetPeriod) {
@@ -35,17 +33,17 @@ FPGA20Buffers::FPGA20Buffers(GRBEnv &env, FuncInfo &funcInfo,
     setup();
 }
 
-FPGA20Buffers::FPGA20Buffers(GRBEnv &env, FuncInfo &funcInfo,
+CostAwareBuffers::CostAwareBuffers(GRBEnv &env, FuncInfo &funcInfo,
                              const TimingDatabase &timingDB,
                              double targetPeriod, Logger &logger,
-                             StringRef milpName)
+                            StringRef milpName)
     : BufferPlacementMILP(env, funcInfo, timingDB, targetPeriod, logger,
                           milpName) {
   if (!unsatisfiable)
     setup();
 }
 
-void FPGA20Buffers::extractResult(BufferPlacement &placement) {
+void CostAwareBuffers::extractResult(BufferPlacement &placement) {
   // Iterate over all channels in the circuit
   for (auto &[channel, channelVars] : vars.channelVars) {
     // Extract number and type of slots from the MILP solution, as well as
@@ -54,43 +52,29 @@ void FPGA20Buffers::extractResult(BufferPlacement &placement) {
         channelVars.bufNumSlots.get(GRB_DoubleAttr_X) + 0.5);
     if (numSlotsToPlace == 0)
       continue;
-
-    // forceBreakDVR == 1 means cut D, V, R; forceBreakDVR == 0 means cut nothing.
-    bool forceBreakDVR = channelVars.signalVars[SignalType::DATA].bufPresent.get(
-                           GRB_DoubleAttr_X) > 0;
+    
+    unsigned latencyV = static_cast<unsigned>(
+        channelVars.signalVars[SignalType::VALID].latency.get(GRB_DoubleAttr_X) + 0.5);
+    unsigned latencyR = static_cast<unsigned>(
+        channelVars.signalVars[SignalType::READY].latency.get(GRB_DoubleAttr_X) + 0.5);
+    bool useShiftReg = channelVars.shiftReg.get(GRB_DoubleAttr_X) > 0;
     
     handshake::ChannelBufProps &props = channelProps[channel];
 
     PlacementResult result;
-    // 1. If breaking DVR:
-    // When numslot = 1, map to ONE_SLOT_BREAK_DV;
-    // When numslot = 2, map to ONE_SLOT_BREAK_DV + ONE_SLOT_BREAK_R;
-    // When numslot > 2, map to ONE_SLOT_BREAK_DV + (numslot - 2) * FIFO_BREAK_NONE + ONE_SLOT_BREAK_R.
-
-    // 2. If breaking none:
-    // When numslot = 1, map to ONE_SLOT_BREAK_R;
-    // When numslot > 1, map to numslot * FIFO_BREAK_NONE.
-    if (forceBreakDVR) {
-      if (numSlotsToPlace == 1) {
-        result.numOneSlotDV = 1;
-      } else if (numSlotsToPlace == 2) {
-        result.numOneSlotDV = 1;
-        result.numOneSlotR = 1;
-      } else {
-        if (props.minOpaque <= 1) {
-          result.numOneSlotDV = 1;
-          result.numFifoNone = numSlotsToPlace - 1;
-        } else {
-          result.numOneSlotDV = 1;
-          result.numFifoNone = numSlotsToPlace - 2;
-          result.numOneSlotR = 1;
-        }
-      }
+    if (useShiftReg) {
+      result.numShiftRegDV = latencyV;
+      result.numOneSlotR = latencyR;
+      result.numFifoNone = numSlotsToPlace - latencyV - latencyR;
     } else {
-      if (numSlotsToPlace == 1) {
-        result.numOneSlotR = 1;
+      if (latencyV + latencyR <= numSlotsToPlace) {
+        result.numOneSlotDV = latencyV;
+        result.numOneSlotR = latencyR;
+        result.numFifoNone = numSlotsToPlace - latencyV - latencyR;
       } else {
-        result.numFifoNone = numSlotsToPlace;
+        result.numOneSlotDV = numSlotsToPlace - latencyR;
+        result.numOneSlotDVR = latencyV + latencyR - numSlotsToPlace;
+        result.numOneSlotR = numSlotsToPlace - latencyV;
       }
     }
 
@@ -114,34 +98,21 @@ void FPGA20Buffers::extractResult(BufferPlacement &placement) {
   setDialectAttr(funcInfo.funcOp, cfdfcTPMap);
 }
 
-void FPGA20Buffers::addCustomChannelConstraints(Value channel) {
+void CostAwareBuffers::addCustomChannelConstraints(Value channel) {
   ChannelVars &chVars = vars.channelVars[channel];
   handshake::ChannelBufProps &props = channelProps[channel];
-  GRBVar &dataBuf = chVars.signalVars[SignalType::DATA].bufPresent;
-  GRBVar &readyBuf = chVars.signalVars[SignalType::READY].bufPresent;
-
-  model.addConstr(dataBuf == readyBuf, "custom_data_ready_sync");
+  GRBVar &latencyV = chVars.signalVars[SignalType::VALID].latency;
 
   if (props.minOpaque > 0) {
-    // Force the MILP to use opaque slots
-    model.addConstr(dataBuf == 1, "custom_forceOpaque");
-    if (props.minTrans > 0) {
-      // If the properties ask for both opaque and transparent slots, let
-      // opaque slots take over. Transparents slots will be placed "manually"
-      // from the total number of slots indicated by the MILP's result
-      unsigned minTotalSlots = props.minOpaque + props.minTrans;
-      model.addConstr(chVars.bufNumSlots >= minTotalSlots,
-                      "custom_minOpaqueAndTrans");
-    } else {
-      // Force the MILP to place a minimum number of opaque slots
-      model.addConstr(chVars.bufNumSlots >= props.minOpaque,
-                      "custom_minOpaque");
-    }
-  } else if (props.minTrans > 0) {
+    // Force the MILP to place a minimum number of opaque slots
+    model.addConstr(latencyV >= props.minOpaque, "custom_forceOpaque");
+  } 
+  if (props.minTrans > 0) {
     // Force the MILP to place a minimum number of transparent slots
-    model.addConstr(chVars.bufNumSlots >= props.minTrans + dataBuf,
+    model.addConstr(chVars.bufNumSlots >= props.minTrans + latencyV,
                     "custom_minTrans");
-  } else if (props.minSlots > 0) {
+  } 
+  if (props.minSlots > 0) {
     // Force the MILP to place a minimum number of slots
     model.addConstr(chVars.bufNumSlots >= props.minSlots,
                     "custom_minSlots");
@@ -153,7 +124,7 @@ void FPGA20Buffers::addCustomChannelConstraints(Value channel) {
   if (props.maxOpaque.has_value()) {
     if (*props.maxOpaque == 0) {
       // Force the MILP to use transparent slots
-      model.addConstr(dataBuf == 0, "custom_forceTransparent");
+      model.addConstr(latencyV == 0, "custom_forceTransparent");
     }
     if (props.maxTrans.has_value()) {
       // Force the MILP to use a maximum number of slots
@@ -168,7 +139,7 @@ void FPGA20Buffers::addCustomChannelConstraints(Value channel) {
   }
 }
 
-void FPGA20Buffers::setup() {
+void CostAwareBuffers::setup() {
   // Signals for which we have variables
   SmallVector<SignalType, 4> signals;
   signals.push_back(SignalType::DATA);
@@ -186,7 +157,7 @@ void FPGA20Buffers::setup() {
     // that are not adjacent to a memory interface
     if (!channel.getDefiningOp<handshake::MemoryOpInterface>() &&
         !isa<handshake::MemoryOpInterface>(*channel.getUsers().begin())) {
-      addSimpleBufferPresenceConstraints(channel, signals);
+      addGeneralBufferPresenceConstraints(channel, signals);
       addTargetPeriodConstraints(channel, signals);
       addSimpleChannelTimingConstraints(channel, signals);
       addSignalLatencyConstraints(channel);
@@ -196,6 +167,8 @@ void FPGA20Buffers::setup() {
   // Add timing constraints for all units in the function
   for (Operation &op : funcInfo.funcOp.getOps()) {
     addUnitTimingConstraints(&op, SignalType::DATA);
+    addUnitTimingConstraints(&op, SignalType::VALID);
+    addUnitTimingConstraints(&op, SignalType::READY);
   }
 
   // Create CFDFC variables and add throughput constraints for each CFDFC that
@@ -208,12 +181,12 @@ void FPGA20Buffers::setup() {
     addCFDFCVars(*cfdfc);
     // Add throughput constraints on each CFDFC
     addTokenDistributionConstraints(*cfdfc);
-    addSimpleChannelThroughputConstraints(*cfdfc);
+    addQuadraticChannelThroughputConstraints(*cfdfc);
     addUnitThroughputConstraints(*cfdfc);
   }
 
   // Add the MILP objective and mark the MILP ready to be optimized
-  addMaxThroughputObjective(allChannels, cfdfcs);
+  addCostAwareObjective(allChannels, cfdfcs);
   markReadyToOptimize();
 }
 

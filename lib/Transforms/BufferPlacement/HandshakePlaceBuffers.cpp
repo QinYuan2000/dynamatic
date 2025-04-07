@@ -571,13 +571,14 @@ void HandshakePlaceBuffersPass::instantiateBuffers(BufferPlacement &placement) {
     };
 
     if (placeRes.bufferOrder) {
+      placeBuffer(TimingInfo::oehb(), BufferOp::SHIFT_REG_BREAK_DV, placeRes.numShiftRegDV);
       for (unsigned int i = 0; i < placeRes.numOneSlotDVR; i++) {
         placeBuffer(TimingInfo::one_slot_break_dvr(), BufferOp::ONE_SLOT_BREAK_DVR, 1);
       }
       for (unsigned int i = 0; i < placeRes.numOneSlotDV; i++) {
         placeBuffer(TimingInfo::oehb(), BufferOp::ONE_SLOT_BREAK_DV, 1);
       }
-      placeBuffer(TimingInfo::fifo_break_dv(), BufferOp::FIFO_BREAK_DV, placeRes.numFifoDV);
+      placeBuffer(TimingInfo::oehb(), BufferOp::FIFO_BREAK_DV, placeRes.numFifoDV);
       placeBuffer(TimingInfo::fifo_break_none(), BufferOp::FIFO_BREAK_NONE, placeRes.numFifoNone);
       for (unsigned int i = 0; i < placeRes.numOneSlotR; i++) {
         placeBuffer(TimingInfo::tehb(), BufferOp::ONE_SLOT_BREAK_R, 1);
@@ -587,13 +588,14 @@ void HandshakePlaceBuffersPass::instantiateBuffers(BufferPlacement &placement) {
         placeBuffer(TimingInfo::tehb(), BufferOp::ONE_SLOT_BREAK_R, 1);
       }
       placeBuffer(TimingInfo::fifo_break_none(), BufferOp::FIFO_BREAK_NONE, placeRes.numFifoNone);
-      placeBuffer(TimingInfo::fifo_break_dv(), BufferOp::FIFO_BREAK_DV, placeRes.numFifoDV);
+      placeBuffer(TimingInfo::oehb(), BufferOp::FIFO_BREAK_DV, placeRes.numFifoDV);
       for (unsigned int i = 0; i < placeRes.numOneSlotDV; i++) {
         placeBuffer(TimingInfo::oehb(), BufferOp::ONE_SLOT_BREAK_DV, 1);
       }
       for (unsigned int i = 0; i < placeRes.numOneSlotDVR; i++) {
         placeBuffer(TimingInfo::one_slot_break_dvr(), BufferOp::ONE_SLOT_BREAK_DVR, 1);
       }
+      placeBuffer(TimingInfo::oehb(), BufferOp::SHIFT_REG_BREAK_DV, placeRes.numShiftRegDV);
     }
   }
 }
