@@ -226,7 +226,7 @@ void BufferPlacementMILP::addGeneralBufferPresenceConstraints(
     GRBVar &bufPresent = signalVars.bufPresent;
     GRBVar &latency = signalVars.latency;
     
-    if (sig == SignalType::Ready){
+    if (sig == SignalType::Ready) {
       // There is a buffer present on a signal iff latency >= 1, READY latency is
       // at most 1 because higher values will not improve the model performance.
       model.addConstr(bufPresent == latency, 
@@ -613,7 +613,7 @@ void BufferPlacementMILP::addMaxThroughputObjective(ValueRange channels,
     objective -= maxCoefCFDFC * slotPenaltyMul * channelVars.bufNumSlots;
 
     handshake::ChannelBufProps &props = channelProps[channel];
-    if (props.minSlots > 0){
+    if (props.minSlots > 0) {
       objective -= maxCoefCFDFC * DVPenaltyMul * channelVars.signalVars[SignalType::DATA].bufPresent;
     }
   }
@@ -672,7 +672,7 @@ void BufferPlacementMILP::addCostAwareObjective(ValueRange channels,
     objective -= maxCoefCFDFC * shiftRegSlotPenaltyMul * latencyV * shiftReg;
 
     handshake::ChannelBufProps &props = channelProps[channel];
-    if (props.minSlots > 0){
+    if (props.minSlots > 0) {
       objective -= maxCoefCFDFC * DVPenaltyMul * channelVars.signalVars[SignalType::DATA].bufPresent;
     }
   }
