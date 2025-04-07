@@ -12,6 +12,8 @@
 
 #include "dynamatic/Transforms/BufferPlacement/CostAwareBuffers.h"
 #include "dynamatic/Dialect/Handshake/HandshakeOps.h"
+#include "dynamatic/Support/Attribute.h"
+#include "dynamatic/Support/CFG.h"
 #include "dynamatic/Support/TimingModels.h"
 #include "dynamatic/Transforms/BufferPlacement/BufferingSupport.h"
 #include "mlir/IR/Value.h"
@@ -59,8 +61,6 @@ void CostAwareBuffers::extractResult(BufferPlacement &placement) {
         channelVars.signalVars[SignalType::READY].latency.get(GRB_DoubleAttr_X) + 0.5);
     bool useShiftReg = channelVars.shiftReg.get(GRB_DoubleAttr_X) > 0;
     
-    handshake::ChannelBufProps &props = channelProps[channel];
-
     PlacementResult result;
     if (useShiftReg) {
       result.numShiftRegDV = latencyV;

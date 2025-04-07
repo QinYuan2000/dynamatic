@@ -226,7 +226,7 @@ void BufferPlacementMILP::addGeneralBufferPresenceConstraints(
     GRBVar &bufPresent = signalVars.bufPresent;
     GRBVar &latency = signalVars.latency;
     
-    if (sig == SignalType::Ready) {
+    if (sig == SignalType::READY) {
       // There is a buffer present on a signal iff latency >= 1, READY latency is
       // at most 1 because higher values will not improve the model performance.
       model.addConstr(bufPresent == latency, 
@@ -666,7 +666,7 @@ void BufferPlacementMILP::addCostAwareObjective(ValueRange channels,
     GRBVar &shiftReg = channelVars.shiftReg;
     GRBVar &latencyV = channelVars.signalVars[SignalType::VALID].latency;
     objective -= maxCoefCFDFC * bufPenaltyMul * bufPresent;
-    objective -= maxCoefCFDFC * largeslotPenaltyMul * (bufNumSlots - latencyV);
+    objective -= maxCoefCFDFC * largeSlotPenaltyMul * (bufNumSlots - latencyV);
     objective -= maxCoefCFDFC * smallSlotPenaltyMul * latencyV * (1 - shiftReg);
     objective -= maxCoefCFDFC * shiftRegPenaltyMul * shiftReg;
     objective -= maxCoefCFDFC * shiftRegSlotPenaltyMul * latencyV * shiftReg;
