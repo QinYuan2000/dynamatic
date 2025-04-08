@@ -606,16 +606,10 @@ void BufferPlacementMILP::addMaxThroughputObjective(ValueRange channels,
   // and another penalty that depends on the number of slots
   double bufPenaltyMul = 1e-4;
   double slotPenaltyMul = 1e-5;
-  double DVPenaltyMul = 3e-4;
   for (Value channel : channels) {
     ChannelVars &channelVars = vars.channelVars[channel];
     objective -= maxCoefCFDFC * bufPenaltyMul * channelVars.bufPresent;
     objective -= maxCoefCFDFC * slotPenaltyMul * channelVars.bufNumSlots;
-
-    handshake::ChannelBufProps &props = channelProps[channel];
-    if (props.minSlots > 0) {
-      objective -= maxCoefCFDFC * DVPenaltyMul * channelVars.signalVars[SignalType::DATA].bufPresent;
-    }
   }
 
   // Finally, set the MILP objective
@@ -658,7 +652,6 @@ void BufferPlacementMILP::addCostAwareObjective(ValueRange channels,
   double smallSlotPenaltyMul = 1e-5;
   double shiftRegPenaltyMul = 1e-5;
   double shiftRegSlotPenaltyMul = 1e-7;
-  double DVPenaltyMul = 3e-4;
   for (Value channel : channels) {
     ChannelVars &channelVars = vars.channelVars[channel];
     GRBVar &bufPresent = channelVars.bufPresent;
@@ -670,11 +663,6 @@ void BufferPlacementMILP::addCostAwareObjective(ValueRange channels,
     objective -= maxCoefCFDFC * smallSlotPenaltyMul * latencyV * (1 - shiftReg);
     objective -= maxCoefCFDFC * shiftRegPenaltyMul * shiftReg;
     objective -= maxCoefCFDFC * shiftRegSlotPenaltyMul * latencyV * shiftReg;
-
-    handshake::ChannelBufProps &props = channelProps[channel];
-    if (props.minSlots > 0) {
-      objective -= maxCoefCFDFC * DVPenaltyMul * channelVars.signalVars[SignalType::DATA].bufPresent;
-    }
   }
 
   // Finally, set the MILP objective
