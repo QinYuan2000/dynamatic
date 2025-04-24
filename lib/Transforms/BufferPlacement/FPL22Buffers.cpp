@@ -347,14 +347,14 @@ void CFDFCUnionBuffers::setup() {
   signalGroups.push_back(opaqueGroup);
   signalGroups.push_back(transparentGroup);
 
-  // Create channel variables and add custom, path, and elasticity contraints
+  // Create channel variables and add custom, timing, and elasticity contraints
   // over all channels in the CFDFC union
   for (Value channel : cfUnion.channels) {
     // Create variables and add custom channel constraints
     addChannelVars(channel, signals);
     addCustomChannelConstraints(channel);
 
-    // Add single-domain path constraints
+    // Add single-domain timing constraints
     addSimpleBufferPresenceConstraints(channel, signals);
     addTargetPeriodConstraints(channel, signals);
     addBufferTimingConstraints(channel, SignalType::DATA, bufModel, {},
@@ -461,7 +461,7 @@ void OutOfCycleBuffers::setup() {
            !isa<handshake::MemoryOpInterface>(*channel.getUsers().begin());
   };
 
-  // Create variables and  add path and elasticity constraints for all channels
+  // Create variables and add timing and elasticity constraints for all channels
   // covered by the MILP. These are the channels that are not part of any CFDFC
   // identified in the Handshake function under consideration
   for (auto [channel, _] : channelProps) {
