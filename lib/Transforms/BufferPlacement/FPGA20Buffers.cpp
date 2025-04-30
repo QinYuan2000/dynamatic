@@ -79,11 +79,9 @@ void FPGA20Buffers::extractResult(BufferPlacement &placement) {
         result.numOneSlotR = 1;
       } else {
         if (props.minOpaque <= 1) {
-          result.numOneSlotDV = 1;
-          result.numFifoNone = numSlotsToPlace - 1;
+          result.numFifoDV = numSlotsToPlace;
         } else {
-          result.numOneSlotDV = 1;
-          result.numFifoNone = numSlotsToPlace - 2;
+          result.numFifoDV = numSlotsToPlace - 1;
           result.numOneSlotR = 1;
         }
       }
