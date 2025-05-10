@@ -58,8 +58,8 @@ void CostAwareBuffers::extractResult(BufferPlacement &placement) {
     unsigned dataLatency = static_cast<unsigned>(
         channelVars.dataLatency.get(GRB_DoubleAttr_X) + 0.5);
     unsigned readyLatency = static_cast<unsigned>(
-        channelVars.signalVars[SignalType::READY].bufPresent);
-    bool useShiftReg = channelVars.shiftReg.get(GRB_DoubleAttr_X) > 0;
+        channelVars.signalVars[SignalType::READY].bufPresent.get(GRB_DoubleAttr_X) + 0.5);
+    bool useShiftReg = channelVars.shiftReg.get(GRB_DoubleAttr_X) > 0.5;
     
     PlacementResult result;
     if (useShiftReg) {
@@ -147,7 +147,7 @@ void CostAwareBuffers::setup() {
   signals.push_back(SignalType::READY);
 
   const TimingModel *bufModel = nullptr;
-  
+
   // Create channel variables and constraints
   std::vector<Value> allChannels;
   for (auto &[channel, _] : channelProps) {
