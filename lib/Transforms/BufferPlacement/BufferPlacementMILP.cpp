@@ -354,10 +354,10 @@ void BufferPlacementMILP::addBufferLatencyConstraints(Value channel) {
 
   // Second version using big-M
   // Assume there are at most 100 slots on the channel
-  model.addConstr(dataLatency * 0.01 <= dataBuf, "dataBuf_if_dataLatency");
-  model.addConstr(dataLatency * 0.01 <= validBuf, "validBuf_if_dataLatency");
-  model.addConstr(dataLatency >= dataBuf, "dataLatency_if_dataBuf");
-  model.addConstr(dataLatency >= validBuf, "dataLatency_if_validBuf");
+  // model.addConstr(dataLatency * 0.01 <= dataBuf, "dataBuf_if_dataLatency");
+  // model.addConstr(dataLatency * 0.01 <= validBuf, "validBuf_if_dataLatency");
+  // model.addConstr(dataLatency >= dataBuf, "dataLatency_if_dataBuf");
+  // model.addConstr(dataLatency >= validBuf, "dataLatency_if_validBuf");
 
   // The dataBuf and validBuf must be equal
   model.addConstr(dataBuf == validBuf, "dataBuf_validBuf_equal");
@@ -377,12 +377,12 @@ void BufferPlacementMILP::addBufferLatencyConstraints(Value channel) {
 
   // Second version using big-M
 
-  // The latency does not exceed the number of buffer slots.
-  model.addConstr(dataLatency <= bufNumSlots, "latency_le_bufSlots");
-  // Shift registers only introduce data (and valid) latency.
-  // If shift registers are used, there must be enough slots for them.
-  model.addConstr(dataLatency + readyBuf <= bufNumSlots + 100 * (1 - shiftReg),
-                  "enough_slots_for_shiftReg");
+  // // The latency does not exceed the number of buffer slots.
+  // model.addConstr(dataLatency <= bufNumSlots, "latency_le_bufSlots");
+  // // Shift registers only introduce data (and valid) latency.
+  // // If shift registers are used, there must be enough slots for them.
+  // model.addConstr(dataLatency + readyBuf <= bufNumSlots + 100 * (1 - shiftReg),
+  //                 "enough_slots_for_shiftReg");
 }
 
 void BufferPlacementMILP::addBufferingGroupConstraints(
