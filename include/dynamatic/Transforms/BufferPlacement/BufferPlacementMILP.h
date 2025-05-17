@@ -272,8 +272,8 @@ protected:
   /// to the model.
   /// 
   /// The function assumes that the buffer's latency is a binary value. Choose 
-  /// only one function between 'addThroughputConstraintsForBinaryLatencyChannel'
-  /// and 'addThroughputConstraintsForIntegerLatencyChannel'.
+  /// only one function between 'addChannelThroughputConstraintsForBinaryLatencyChannel'
+  /// and 'addChannelThroughputConstraintsForIntegerLatencyChannel'.
   void addChannelThroughputConstraintsForBinaryLatencyChannel(CFDFC &cfdfc);
 
   // Channel throughput constraints considering the integer buffer latency on
