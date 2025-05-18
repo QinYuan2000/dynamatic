@@ -91,6 +91,7 @@ void CostAwareBuffers::extractResult(BufferPlacement &placement) {
           result.numFifoNone = numSlotsToPlace - dataLatency - readyLatency;
         }
       } else {
+        hasOneThroughputCFDFC = true;
         if (hasOneThroughputCFDFC){
           if (dataLatency == 1) {
             result.numOneSlotDV = 1;
@@ -131,7 +132,12 @@ void CostAwareBuffers::addCustomChannelConstraints(Value channel) {
   ChannelVars &chVars = vars.channelVars[channel];
   handshake::ChannelBufProps &props = channelProps[channel];
   GRBVar &dataLatency = chVars.dataLatency;
-  GRBVar &readyBuf = chVars.signalVars[SignalType::READY].bufPresent;
+  for (mlir::Operation *user : channel.getUsers()) {
+    if (isa<handshake::LoadOp>(user)) {
+      props.minTrans = 0;
+      break;
+    }
+  }
 
   if (props.minOpaque > 0) {
     // Force the MILP to place a minimum number of opaque slots
@@ -139,7 +145,7 @@ void CostAwareBuffers::addCustomChannelConstraints(Value channel) {
   } 
   if (props.minTrans > 0) {
     // Force the MILP to place a minimum number of transparent slots
-    model.addConstr(chVars.bufNumSlots >= props.minTrans + dataLatency + readyBuf,
+    model.addConstr(chVars.bufNumSlots >= props.minTrans + dataLatency,
                     "custom_minTrans");
   } 
   if (props.minSlots > 0) {
@@ -292,7 +298,7 @@ void CostAwareBuffers::setup() {
       addCFDFCVars(*cfdfc);
       // Add throughput constraints on each CFDFC
       addSteadyStateReachabilityConstraints(*cfdfc);
-      addThroughputConstraintsForIntegerLatencyChannel(*cfdfc);
+      addChannelThroughputConstraintsForIntegerLatencyChannel(*cfdfc);
       addUnitThroughputConstraints(*cfdfc);
     }
 
@@ -324,7 +330,7 @@ void CostAwareBuffers::setup() {
         // addChannelTimingConstraints(channel, SignalType::VALID, bufModel);
         // addChannelTimingConstraints(channel, SignalType::READY, bufModel);
         addBufferPresenceConstraints(channel);
-        addBufferLatencyConstraints(channel);
+        // addBufferLatencyConstraints(channel);
       }
     }
 
@@ -345,7 +351,7 @@ void CostAwareBuffers::setup() {
       addCFDFCVars(*cfdfc);
       // Add throughput constraints on each CFDFC
       addSteadyStateReachabilityConstraints(*cfdfc);
-      addThroughputConstraintsForBinaryLatencyChannel(*cfdfc);
+      addChannelThroughputConstraintsForBinaryLatencyChannel(*cfdfc);
       addUnitThroughputConstraints(*cfdfc);
     }
 
@@ -376,6 +382,8 @@ void CostAwareBuffers::setup() {
       if (!channel.getDefiningOp<handshake::MemoryOpInterface>() &&
           !isa<handshake::MemoryOpInterface>(*channel.getUsers().begin())) {
         addChannelTimingConstraints(channel, SignalType::DATA, bufModel);
+        // addChannelTimingConstraints(channel, SignalType::VALID, bufModel);
+        addChannelTimingConstraints(channel, SignalType::READY, bufModel);
         addBufferPresenceConstraints(channel);
         addBufferLatencyConstraints(channel);
       }
@@ -383,6 +391,8 @@ void CostAwareBuffers::setup() {
     
     for (Operation &op : funcInfo.funcOp.getOps()) {
       addUnitTimingConstraints(&op, SignalType::DATA);
+      // addUnitTimingConstraints(&op, SignalType::VALID);
+      addUnitTimingConstraints(&op, SignalType::READY);
     }
     
     cfdfcs.clear();
