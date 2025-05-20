@@ -212,22 +212,18 @@ void CostAwareBuffers::addThroughputConstraintsWithBestThroughput(
     GRBVar &readyBuf = chVars.signalVars[SignalType::READY].bufPresent;
     GRBVar &shiftReg = chVars.shiftReg;
 
-    // Set a ceiling funciton for the extra bubble component introduced by the shift register.
     std::string channelName = getUniqueName(*channel.getUses().begin());
-    std::string extraBubbleVarName = "extra_bubble_" + channelName;
-    std::string extraBubbleConstrName = "extra_bubble_constr_" + channelName;
-    GRBVar extraBubble = model.addVar(0, GRB_INFINITY, 0.0, GRB_INTEGER, extraBubbleVarName);
-    model.addConstr(extraBubble <= dataLatency * bestThroughput + 0.99, extraBubbleConstrName);
+    std::string shiftRegUbName = "shiftReg_ub_" + channelName;
+    GRBVar shiftRegUb = model.addVar(0, GRB_INFINITY, 0.0, GRB_INTEGER, shiftRegUbName);
+    model.addConstr(shiftRegUb <= dataLatency * bestThroughput + 0.99, shiftRegUbName);
     model.addConstr(dataLatency * bestThroughput <= chThroughput, 
                      "throughput_tokens_lb");
-    GRBLinExpr baseExpr = chThroughput + readyBuf * bestThroughput;
-    GRBLinExpr extraExpr = dataLatency - extraBubble;
-    model.addGenConstrIndicator(shiftReg, 0, 
-        baseExpr <= bufNumSlots,
-        "throughput_when_no_shiftreg");
-    model.addGenConstrIndicator(shiftReg, 1,
-        baseExpr + extraExpr <= bufNumSlots,
-        "throughput_when_shiftreg");
+    GRBVar shiftRegLatency = model.addVar(0, GRB_INFINITY, 0.0, GRB_INTEGER, "shiftRegLatency");
+    model.addConstr(shiftRegLatency <= dataLatency - shiftRegUb, "temp1");
+    model.addConstr(shiftRegLatency <= 100 * shiftReg, "temp2");
+    model.addConstr(shiftRegLatency >= dataLatency - shiftRegUb - 100 * (1 - shiftReg), "temp3");
+    model.addConstr(chThroughput + readyBuf * bestThroughput + shiftRegLatency <= bufNumSlots,
+                "throughput_tokens_ub");
   }
 
   for (Operation *unit : cfdfc.units) {

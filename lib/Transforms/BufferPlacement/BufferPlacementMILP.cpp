@@ -321,7 +321,7 @@ void BufferPlacementMILP::addBufferPresenceConstraints(Value channel) {
   GRBVar &bufNumSlots = chVars.bufNumSlots;
 
   // If there is at least one slot, there must be a buffer
-  model.addConstr(0.01 * bufNumSlots <= bufPresent, "buffer_presence");
+  model.addConstr(bufNumSlots <= 100 * bufPresent, "buffer_presence");
 
   for (auto &[sig, signalVars] : chVars.signalVars) {
     // If there is a buffer present on a signal, then there is a buffer present
@@ -339,17 +339,12 @@ void BufferPlacementMILP::addBufferLatencyConstraints(Value channel) {
   GRBVar &validBuf = chVars.signalVars[SignalType::VALID].bufPresent;
   GRBVar &readyBuf = chVars.signalVars[SignalType::READY].bufPresent;
   GRBVar &dataLatency = chVars.dataLatency;
-  GRBVar &shiftReg = chVars.shiftReg;
 
   // There is a buffer breaking data & valid iff dataLatency > 0
-  model.addGenConstrIndicator(dataBuf, 1, dataLatency >= 1, 
-                              "dataBuf_if_dataLatency");
-  model.addGenConstrIndicator(validBuf, 1, dataLatency >= 1,
-                              "validBuf_if_dataLatency");
-  model.addGenConstrIndicator(dataBuf, 0, dataLatency == 0,
-                              "dataLatency_if_dataBuf");
-  model.addGenConstrIndicator(validBuf, 0, dataLatency == 0,
-                              "dataLatency_if_validBuf");
+  model.addConstr(dataLatency <= 100 * dataBuf, "dataBuf_if_dataLatency");
+  model.addConstr(dataLatency <= 100 * validBuf, "validBuf_if_dataLatency");
+  model.addConstr(dataLatency >= dataBuf, "dataLatency_if_dataBuf");
+  model.addConstr(dataLatency >= validBuf, "dataLatency_if_validBuf");
 
   // The dataBuf and validBuf must be equal
   // This constraint is not necessary, but may assist presolve.
@@ -542,16 +537,27 @@ void BufferPlacementMILP::addChannelThroughputConstraintsForIntegerLatencyChanne
     GRBVar &readyBuf = chVars.signalVars[SignalType::READY].bufPresent;
     GRBVar &shiftReg = chVars.shiftReg;
 
-    // Set a ceiling funciton for the extra bubble component introduced by the shift register.
-    std::string channelName = getUniqueName(*channel.getUses().begin());
-    std::string extraBubbleVarName = "extra_bubble_" + channelName;
-    std::string extraBubbleConstrName = "extra_bubble_constr_" + channelName;
-    GRBVar extraBubble = model.addVar(0, GRB_INFINITY, 0.0, GRB_INTEGER, extraBubbleVarName);
-    model.addQConstr(extraBubble <= dataLatency * throughput + 0.99, extraBubbleConstrName);
+    // Throughput constraints enforce lower and upper bounds on token occupancy.
+    // The lower bound of the token occupancy is the data latency multiplied by the
+    // throughput of the CFDFC.
     model.addQConstr(dataLatency * throughput <= chThroughput, 
                      "throughput_tokens_lb");
+    std::string channelName = getUniqueName(*channel.getUses().begin());
+    std::string shiftRegUbName = "shiftReg_ub_" + channelName;
+    // Create the intermediate variable for the token occupancy upper bound of the 
+    // SHIFT_REG_BREAK_DV.
+    GRBVar shiftRegUb = model.addVar(0, GRB_INFINITY, 0.0, GRB_INTEGER, shiftRegUbName);
+    // The token occupancy upper bound of a SHIFT_REG_BREAK_DV buffer is the smallest 
+    // integer greater than the product of the data latency and the CFDFC throughput.
+    model.addQConstr(shiftRegUb <= dataLatency * throughput + 0.99, shiftRegUbName);
+    // The upper bound of token occupancy is the sum over all buffer types:
+    // - For buffers that break the Ready path, the upper bound is their slot number 
+    //   minus the throughput.
+    // - For SHIFT_REG_BREAK_DV, the value is computed as described above.
+    // - For all other types, the upper bound equals their slot number.
+    // Note: The slot number of SHIFT_REG_BREAK_DV equals the data latency.
     model.addQConstr(chThroughput + readyBuf * throughput 
-                    + shiftReg * (dataLatency - extraBubble) <= bufNumSlots, 
+                    + shiftReg * (dataLatency - shiftRegUb) <= bufNumSlots, 
                     "throughput_tokens_ub");
   }
 }
@@ -668,8 +674,13 @@ void BufferPlacementMILP::addBufferAreaAwareObjective(ValueRange channels,
   // For each channel, add a "penalty" in case a buffer is added to the channel,
   // and another penalty that depends on the number of slots
   double bufPenaltyMul = 1e-4;
+  // In general, buffers that break data paths have a lower area cost per slot,
+  // while other types incur a higher cost
   double largeSlotPenaltyMul = 1e-4;
   double smallSlotPenaltyMul = 1e-5;
+  // For SHIFT_REG_BREAK_DV, a small area cost is incurred when the buffer exists
+  // Increasing the slot number only requires additional registers, not LUTs
+  // We assign a minimal cost only to constrain its slot number
   double shiftRegPenaltyMul = 1e-5;
   double shiftRegSlotPenaltyMul = 1e-7;
   for (Value channel : channels) {
