@@ -849,6 +849,22 @@ struct SplitBranchWithMuxCondition
   }
 };
 
+struct EliminateMuxWithIdenticalInputs
+    : public OpRewritePattern<handshake::MuxOp> {
+  using OpRewritePattern<handshake::MuxOp>::OpRewritePattern;
+
+  LogicalResult matchAndRewrite(handshake::MuxOp muxOp,
+                                PatternRewriter &rewriter) const override {
+    if (muxOp.getDataOperands()[0] != muxOp.getDataOperands()[1])
+      return failure();
+
+    logLine("[HandshakeCombineSteeringLogic] "
+            "EliminateMuxWithIdenticalInputs applied\n");
+    rewriter.replaceOp(muxOp, muxOp.getDataOperands()[0]);
+    return success();
+  }
+};
+
 /// Simple driver for the Handshake Combine Branches Merges pass, based on a
 /// greedy pattern rewriter.
 struct HandshakeCombineSteeringLogicPass
@@ -869,7 +885,7 @@ struct HandshakeCombineSteeringLogicPass
                  CombineBranchesOppositeSign, CombineEquivalentNotIOps,
                  CombineInits, CombineMuxes, RemoveNotCondition,
                  SimplifyKnownConditionBranch, EliminateConstantCondBranch,
-                 CombineEquivalentMuxes, CombineEquivalentBranches>(ctx);
+                 CombineEquivalentMuxes, CombineEquivalentBranches, EliminateMuxWithIdenticalInputs>(ctx);
     if (failed(applyPatternsAndFoldGreedily(mod, std::move(patterns), config)))
       return signalPassFailure();
   };
