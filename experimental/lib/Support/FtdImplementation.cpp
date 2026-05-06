@@ -1170,16 +1170,22 @@ static void buildDistributionNetwork(mlir::OpBuilder &builder,
 
   // 1. Collect Variable Requirements
   std::map<std::string, std::vector<VariableRequirement>> varNeeds;
+  DenseSet<Block *> collectOnStack;
   std::function<void(Block *, PathContext)> collect = [&](Block *curr,
                                                           PathContext path) {
     // Stop recursion if reaching the consumer or the sink block
     if (curr == lcfg.newCons || curr == lcfg.sinkBB)
       return;
 
+    // Cycle detection: stop if this block is already on the current DFS path
+    if (!collectOnStack.insert(curr).second)
+      return;
+
     // Find the condition variable
     Block *origBlock = lcfg.origMap.lookup(curr);
     std::string var = "";
-    var = bi.getBlockCondition(origBlock);
+    if (origBlock)
+      var = bi.getBlockCondition(origBlock);
 
     // Record the variable requirement
     if (!var.empty()) {
@@ -1211,6 +1217,8 @@ static void buildDistributionNetwork(mlir::OpBuilder &builder,
         collect(succ, path);
       }
     }
+
+    collectOnStack.erase(curr);
   };
 
   // Start collection from the producer block
@@ -1658,7 +1666,7 @@ static std::unique_ptr<ftd::LocalCFG> buildDecisionGraph(
 /// different suppression contexts (direct suppression and MU gate exit).
 struct CyclicDemotionHelper {
   mlir::OpBuilder &builder;
-  handshake::FuncOp &funcOp;
+  MLIRContext *ctx;
   const ftd::BlockIndexing &bi;
   ftd::CyclicGraphManager &cyclicMgr;
   DenseMap<Block *, Block *> &origToFullDG;
@@ -1669,14 +1677,14 @@ struct CyclicDemotionHelper {
   std::map<std::pair<std::string, unsigned>, Value> demotionCache;
 
   CyclicDemotionHelper(mlir::OpBuilder &builder,
-                        handshake::FuncOp &funcOp,
+                        MLIRContext *ctx,
                         const ftd::BlockIndexing &bi,
                         ftd::CyclicGraphManager &cyclicMgr,
                         DenseMap<Block *, Block *> &origToFullDG,
                         Location loc, Block *insertBlock,
                         DenseMap<Value, SmallVector<Backedge, 2>> *pendingMuxOperands,
                         ftd::ShadowCFG *shadow = nullptr)
-      : builder(builder), funcOp(funcOp), bi(bi),
+      : builder(builder), ctx(ctx), bi(bi),
         cyclicMgr(cyclicMgr), origToFullDG(origToFullDG),
         loc(loc), insertBlock(insertBlock),
         pendingMuxOperands(pendingMuxOperands),
@@ -1724,7 +1732,7 @@ struct CyclicDemotionHelper {
     }
 
     // 1. Extract acyclic layered CFG for this loop scope
-    OpBuilder layerBuilder(funcOp.getContext());
+    OpBuilder layerBuilder(ctx);
     auto levelCFG = cyclicMgr.extractLayeredCFG(scope, layerBuilder);
 
     // 2. CDA on levelCFG (main suppression: header -> loop exit)
@@ -1773,7 +1781,7 @@ struct CyclicDemotionHelper {
     Block *origHeader = levelCFG->origMap.lookup(levelCFG->newProd);
 
     if (origHeader && origHeader != origBlock) {
-      OpBuilder dpBuilder(funcOp.getContext());
+      OpBuilder dpBuilder(ctx);
       auto dpLocGraph =
           buildLocalCFGRegion(dpBuilder, origHeader, origBlock, bi);
       if (dpLocGraph->newCons) {
@@ -1942,7 +1950,6 @@ struct CyclicDemotionHelper {
 static void insertDirectSuppression(
     mlir::OpBuilder &builder, handshake::FuncOp &funcOp, Operation *consumer,
     Value connection, ftd::ShadowCFG &shadow) {
-  // llvm::errs() << "=== Inserting Direct Suppression ===\n";
   Region &shadowRegion = shadow.getRegion();
   ftd::BlockIndexing bi(shadowRegion);
 
@@ -2373,7 +2380,7 @@ static void insertDirectSuppression(
       origToFullDG[origBlock] = dgBlock;
 
   // Create the cyclic demotion helper
-  CyclicDemotionHelper demotionHelper(builder, funcOp, bi, cyclicMgr,
+  CyclicDemotionHelper demotionHelper(builder, funcOp.getContext(), bi, cyclicMgr,
                                        origToFullDG, consumer->getLoc(),
                                        consumer->getBlock(), nullptr, &shadow);
 
@@ -2734,7 +2741,7 @@ void ftd::addRegenOperandConsumer(mlir::OpBuilder &builder,
 
     // 3. Create the cyclic demotion helper
     CyclicDemotionHelper demotionHelper(
-        builder, funcOp, bi, cyclicMgr, origToFullDG,
+        builder, funcOp.getContext(), bi, cyclicMgr, origToFullDG,
         consumerOp->getLoc(), realBlock, nullptr, &shadow);
 
     // 4. Build acyclic decision graph for distribution and expression
@@ -3089,9 +3096,8 @@ LogicalResult experimental::ftd::addGsaGates(
 
         // 3. Create the cyclic demotion helper
         //    (MU gate: producer is at level 0, and no top-level DP needed)
-        auto funcOp = region.getParentOfType<handshake::FuncOp>();
         CyclicDemotionHelper demotionHelper(
-            rewriter, funcOp, bi, cyclicMgr, origToDG,
+            rewriter, region.getContext(), bi, cyclicMgr, origToDG,
             loc, loopHeader, pendingMuxOperands, nullptr);
 
         // 4. Build acyclic decision graph for distribution and expression
