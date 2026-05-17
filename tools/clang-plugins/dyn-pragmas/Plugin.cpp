@@ -188,12 +188,39 @@ private:
     // to an mlir attribute, before running
     // CFToHandshake
 
-    // Inject declaration of a custom speculate function
-    // Take a double as the input variable, as any numeric value can be cast to
-    // double and produce a int as output, as any numeric value can be cast to
-    // from int
-    std::string Decl = "extern int __dyn_speculate(double, int, const char *) "
-                       "__attribute__((noinline, noduplicate));\n";
+    // Define a function
+    // for each type of variable we could speculate on
+    // so that no casts are added before or after the speculator
+    std::string FuncDecls =
+        "extern _Bool  __dyn_speculate_b(_Bool,  int, const char*) "
+        "__attribute__((noinline, noduplicate));\n"
+        "extern char   __dyn_speculate_c(char,   int, const char*) "
+        "__attribute__((noinline, noduplicate));\n"
+        "extern short  __dyn_speculate_s(short,  int, const char*) "
+        "__attribute__((noinline, noduplicate));\n"
+        "extern int    __dyn_speculate_i(int,    int, const char*) "
+        "__attribute__((noinline, noduplicate));\n"
+        "extern long   __dyn_speculate_l(long,   int, const char*) "
+        "__attribute__((noinline, noduplicate));\n"
+        "extern float  __dyn_speculate_f(float,  int, const char*) "
+        "__attribute__((noinline, noduplicate));\n"
+        "extern double __dyn_speculate_d(double, int, const char*) "
+        "__attribute__((noinline, noduplicate));\n";
+
+    // use a generic macro
+    // so that which function to use
+    // and therefore what return type
+    // if chosen at compile time
+    // based on the input variable type
+    std::string GenericMacro =
+        "#define __dyn_speculate(x, n, s) _Generic((x), \\\n"
+        "  _Bool:  __dyn_speculate_b, \\\n"
+        "  char:   __dyn_speculate_c, \\\n"
+        "  short:  __dyn_speculate_s, \\\n"
+        "  int:    __dyn_speculate_i, \\\n"
+        "  long:   __dyn_speculate_l, \\\n"
+        "  float:  __dyn_speculate_f, \\\n"
+        "  double: __dyn_speculate_d)((x), (n), (s))\n";
 
     // produce a call of the spec function on the value being speculate on
     // so that x = spec(x, [other options for speculator])
@@ -210,8 +237,8 @@ private:
     // so we place our fake file into one here
     // and give it the name "<dyn-speculate-injected>"
     // which is purely for error messages
-    auto MB = llvm::MemoryBuffer::getMemBufferCopy(Decl + Call,
-                                                   "<dyn-speculate-injected>");
+    auto MB = llvm::MemoryBuffer::getMemBufferCopy(
+        FuncDecls + GenericMacro + Call, "<dyn-speculate-injected>");
 
     // Here we prep the fake file to be a
     // fake header file
