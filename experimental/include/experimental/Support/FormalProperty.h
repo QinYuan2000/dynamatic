@@ -32,6 +32,7 @@ public:
     ValidEquivalence,
     EagerForkNotAllOutputSent,
     CopiedSlotsOfActiveForksAreFull,
+    EagerForkPathTokenCopiedMaximumOnce,
     ReconvergentPathFlow,
     IOGSingleToken,
     IOGConsecutiveTokens,
@@ -239,6 +240,75 @@ private:
   std::unique_ptr<handshake::InternalStateNamer> copiedSlot;
   inline static const StringLiteral FORK_CHANNELS_LIT = "fork_channels";
   inline static const StringLiteral COPIED_SLOT_LIT = "copied_slot";
+};
+
+// A path of eager forks without slots in between can only contain a single
+// active fork. This is annotated by asserting that, for each fork, if a single
+// output is active, the input must be valid: If there is a path with two forks
+// in a row, and the second one is sent, the input to the second one must be
+// valid. The units "carry" this invariant backwards, until it reaches the other
+// fork, for which the output must be valid. For the output of a fork to be
+// valid, the input must be ready and that output must not be sent, but this
+// means that the other fork cannot have the output sent as well. Note that, if
+// there is a slot along this path, the validity is no longer carried backwards,
+// so this case is handled as well.
+//
+// For example, this invariant rules out the following case (impossible to have
+// two "sent == True" in a row without a slot in between):
+//
+//
+//     |
+//     | Valid
+//     v
+//   EFork0
+//       | sent
+//       |
+//       v
+//     EFork1
+//         | sent
+//         |
+//         v
+//         .
+//
+// Reasoning:
+// sent == true implies the corresponding output handshake signal is not valid
+// Thus EFork0's output (and EFork1's input) has valid == false
+// But invariant states that, as EFork1 has an output with sent == true, EFork's
+// input has valid == true
+// This is a contradiction, so the invalid state shown is ruled out.
+//
+// This invariant is derived from (and equivalent to) Invariant 3 of
+// https://ieeexplore.ieee.org/document/10323796
+class EagerForkPathTokenCopiedMaximumOnce : public FormalProperty {
+public:
+  inline std::string getValidOp() { return validOp; }
+  inline std::string getValidChannel() { return validChannel; }
+  std::vector<handshake::EagerForkSentNamer> getSentStateNamers() {
+    return sentStateNamers;
+  }
+
+  llvm::json::Value extraInfoToJSON() const override;
+
+  static std::unique_ptr<EagerForkPathTokenCopiedMaximumOnce>
+  fromJSON(const llvm::json::Value &value, llvm::json::Path path);
+
+  EagerForkPathTokenCopiedMaximumOnce() = default;
+  EagerForkPathTokenCopiedMaximumOnce(uint64_t id, TAG tag, ForkOp &op);
+  ~EagerForkPathTokenCopiedMaximumOnce() = default;
+
+  static bool classof(const FormalProperty *fp) {
+    return fp->getType() == TYPE::EagerForkPathTokenCopiedMaximumOnce;
+  }
+
+private:
+  // The input channel of the eager fork
+  std::string validOp;
+  std::string validChannel;
+  // The `sent` states that imply the input is active
+  std::vector<handshake::EagerForkSentNamer> sentStateNamers;
+  inline static const StringLiteral SENTS_LIT = "sents";
+  inline static const StringLiteral VALID_CHANNEL_LIT = "valid_channel";
+  inline static const StringLiteral VALID_OP_LIT = "valid_op";
 };
 
 // A pair of two paths is called reconvergent if they split at the same fork,

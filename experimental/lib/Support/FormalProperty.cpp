@@ -31,6 +31,8 @@ FormalProperty::typeFromStr(const std::string &s) {
     return FormalProperty::TYPE::EagerForkNotAllOutputSent;
   if (s == "CopiedSlotsOfActiveForksAreFull")
     return FormalProperty::TYPE::CopiedSlotsOfActiveForksAreFull;
+  if (s == "EagerForkPathTokenCopiedMaximumOnce")
+    return FormalProperty::TYPE::EagerForkPathTokenCopiedMaximumOnce;
   if (s == "ReconvergentPathFlow")
     return FormalProperty::TYPE::ReconvergentPathFlow;
   if (s == "IOGSingleToken")
@@ -59,6 +61,8 @@ std::string FormalProperty::typeToStr(TYPE t) {
     return "EagerForkNotAllOutputSent";
   case TYPE::CopiedSlotsOfActiveForksAreFull:
     return "CopiedSlotsOfActiveForksAreFull";
+  case TYPE::EagerForkPathTokenCopiedMaximumOnce:
+    return "EagerForkPathTokenCopiedMaximumOnce";
   case TYPE::ReconvergentPathFlow:
     return "ReconvergentPathFlow";
   case TYPE::IOGSingleToken:
@@ -130,6 +134,9 @@ FormalProperty::fromJSON(const llvm::json::Value &value,
   case TYPE::CopiedSlotsOfActiveForksAreFull:
     return CopiedSlotsOfActiveForkAreFull::fromJSON(value,
                                                     path.field(INFO_LIT));
+  case TYPE::EagerForkPathTokenCopiedMaximumOnce:
+    return EagerForkPathTokenCopiedMaximumOnce::fromJSON(value,
+                                                         path.field(INFO_LIT));
   case TYPE::ReconvergentPathFlow:
     return ReconvergentPathFlow::fromJSON(value, path.field(INFO_LIT));
   case TYPE::IOGSingleToken:
@@ -362,6 +369,39 @@ CopiedSlotsOfActiveForkAreFull::fromJSON(const llvm::json::Value &value,
   llvm::json::ObjectMapper mapper(info, path);
   if (!mapper || !mapper.map(FORK_CHANNELS_LIT, prop->sentStateNamers) ||
       !mapper.map(COPIED_SLOT_LIT, prop->copiedSlot))
+    return nullptr;
+  return prop;
+}
+
+// Eager Fork Path
+
+EagerForkPathTokenCopiedMaximumOnce::EagerForkPathTokenCopiedMaximumOnce(
+    uint64_t id, TAG tag, ForkOp &op)
+    : FormalProperty(id, tag, TYPE::EagerForkPathTokenCopiedMaximumOnce) {
+  PortNamer namer(op);
+  // ForkOp has only 1 input
+  validOp = getUniqueName(op);
+  validChannel = namer.getInputName(0).str();
+  sentStateNamers = op.getInternalSentStateNamers();
+}
+
+llvm::json::Value EagerForkPathTokenCopiedMaximumOnce::extraInfoToJSON() const {
+  return llvm::json::Object({{VALID_OP_LIT, validOp},
+                             {VALID_CHANNEL_LIT, validChannel},
+                             {SENTS_LIT, sentStateNamers}});
+}
+
+std::unique_ptr<EagerForkPathTokenCopiedMaximumOnce>
+EagerForkPathTokenCopiedMaximumOnce::fromJSON(const llvm::json::Value &value,
+                                              llvm::json::Path path) {
+  auto prop = std::make_unique<EagerForkPathTokenCopiedMaximumOnce>();
+
+  auto info = prop->parseBaseAndExtractInfo(value, path);
+
+  llvm::json::ObjectMapper mapper(info, path);
+  if (!mapper || !mapper.map(VALID_OP_LIT, prop->validOp) ||
+      !mapper.map(VALID_CHANNEL_LIT, prop->validChannel) ||
+      !mapper.map(SENTS_LIT, prop->sentStateNamers))
     return nullptr;
   return prop;
 }
