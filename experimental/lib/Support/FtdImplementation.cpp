@@ -554,82 +554,8 @@ void ftd::addRegenOperandConsumer(mlir::OpBuilder &builder,
     Value conditionValue;
     Block *loopHeader = loop->getHeader();
 
-    // 1. Build Local CFG with Prod = Cons = Loop Header
-    // This graph captures the loop-back paths.
-    OpBuilder tmpBuilder(funcOp.getContext());
-    auto locGraph =
-        buildLocalCFGRegion(tmpBuilder, loopHeader, loopHeader, bi);
-    ControlDependenceAnalysis locCDATmp(*locGraph->region);
-    DenseSet<Block *> locConsControlDepsFull =
-        locCDATmp.getAllBlockDeps()[locGraph->newCons].allControlDeps;
-    DenseSet<Block *> locConsAcyclicDeps =
-        locCDATmp.getAllBlockDeps()[locGraph->newCons].allControlDeps;
-
-    // 2. Build full decision graph for CyclicGraphManager
-    auto fullDecisionGraph =
-        buildDecisionGraph(*locGraph, locConsControlDepsFull);
-    ftd::CyclicGraphManager cyclicMgr(*fullDecisionGraph);
-
-    DenseMap<Block *, Block *> origToFullDG;
-    for (auto [dgBlock, origBlock] : fullDecisionGraph->origMap)
-      if (origBlock)
-        origToFullDG[origBlock] = dgBlock;
-
-    // 3. Create the cyclic demotion helper
-    CyclicDemotionHelper demotionHelper(
-        builder, funcOp.getContext(), bi, cyclicMgr, origToFullDG,
-        consumerOp->getLoc(), realBlock, nullptr, &shadow);
-
-    // 4. Build acyclic decision graph for distribution and expression
-    auto acyclicDG =
-        buildDecisionGraph(*locGraph, locConsAcyclicDeps);
-
-    // 5. Pre-register demoted values for high-level variables
-    SignalRegistry registry;
-    demotionHelper.preRegisterDemotedValues(acyclicDG, registry);
-
-    // 6. Construct distribution circuit
-    buildDistributionNetwork(builder, *acyclicDG, bi, registry, nullptr, &shadow);
-
-    // 7. Control Dependence Analysis on the acyclic Decision Graph
-    ControlDependenceAnalysis locCDA(*acyclicDG->region);
-    DenseSet<Block *> locConsControlDeps =
-        locCDA.getAllBlockDeps()[acyclicDG->newCons].allControlDeps;
-
-    // 8. Enumerate paths to get the boolean expression for the backedges
-    BoolExpression *fBackedge =
-        enumeratePaths(*acyclicDG, bi, locConsControlDeps);
-    fBackedge = fBackedge->boolMinimize();
-
-    // 9. Build BDD with topologically sorted cofactorList
-    std::set<std::string> vars = fBackedge->getVariables();
-
-    DenseMap<Block *, unsigned> rank;
-    unsigned ri = 0;
-    for (Block *b : acyclicDG->topoOrder)
-      if (auto *ob = acyclicDG->origMap.lookup(b))
-        rank[ob] = ri++;
-
-    std::vector<std::string> cofactorList;
-    cofactorList.reserve(vars.size());
-    std::vector<std::pair<unsigned, std::string>> tmp;
-    for (auto &var : vars)
-      if (auto blkOpt = bi.getBlockFromCondition(var))
-        if (rank.count(*blkOpt))
-          tmp.emplace_back(rank[*blkOpt], var);
-    llvm::sort(tmp, [](auto &a, auto &b) { return a.first < b.first; });
-    for (auto &p : tmp)
-      cofactorList.push_back(p.second);
-
-    BDD *bdd = buildBDD(fBackedge, cofactorList);
-    // 10. Convert to Circuit.
-    conditionValue =
-        bddToCircuit(builder, bdd, realBlock, registry, {}, bi, nullptr, &shadow);
-
-    // Clean up temporary graphs
-    acyclicDG->containerOp->erase();
-    fullDecisionGraph->containerOp->erase();
-    locGraph->containerOp->erase();
+    conditionValue = computeLoopBackedgeCondition(
+        builder, loopHeader, realBlock, bi, nullptr, &shadow);
 
     // Create the false constant to feed `init`
     auto constOp = builder.create<handshake::ConstantOp>(consumerOp->getLoc(),
@@ -917,87 +843,9 @@ LogicalResult experimental::ftd::addGsaGates(
       if (gate->gsaGateFunction == MuGate) {
         // For MU gates, we generate the condition based on the
         // reaching condition from the loop header back to itself.
-        OpBuilder tmpBuilder(region.getContext());
         Block *loopHeader = gate->getBlock();
-
-        // 1. Build Local CFG with Prod = Cons = Loop Header
-        // This graph captures the loop-back paths.
-        auto locGraph =
-            buildLocalCFGRegion(tmpBuilder, loopHeader, loopHeader, bi);
-        ControlDependenceAnalysis locCDATmp(*locGraph->region);
-        DenseSet<Block *> locConsControlDepsTmp =
-            locCDATmp.getAllBlockDeps()[locGraph->newCons].allControlDeps;
-        DenseSet<Block *> locConsAcyclicDeps =
-            locCDATmp.getAllBlockDeps()[locGraph->newCons].allControlDeps;
-
-        // 2. Build decision graph for CyclicGraphManager
-        auto decisionGraph =
-            buildDecisionGraph(*locGraph, locConsControlDepsTmp);
-        ftd::CyclicGraphManager cyclicMgr(*decisionGraph);
-
-        DenseMap<Block *, Block *> origToDG;
-        for (auto [dgBlock, origBlock] : decisionGraph->origMap)
-          if (origBlock)
-            origToDG[origBlock] = dgBlock;
-
-        // 3. Create the cyclic demotion helper
-        //    (MU gate: producer is at level 0, and no top-level DP needed)
-        CyclicDemotionHelper demotionHelper(
-            rewriter, region.getContext(), bi, cyclicMgr, origToDG,
-            loc, loopHeader, pendingMuxOperands, nullptr);
-
-        // 4. Build acyclic decision graph for distribution and expression
-        auto acyclicDG =
-            buildDecisionGraph(*locGraph, locConsAcyclicDeps);
-
-        // 5. Pre-register demoted values for high-level variables
-        SignalRegistry registry;
-        demotionHelper.preRegisterDemotedValues(acyclicDG, registry);
-
-        // 6. Construct distribution circuit
-        buildDistributionNetwork(rewriter, *acyclicDG, bi, registry, pendingMuxOperands);
-
-        // 7. Control Dependence Analysis on the acyclic Decision Graph
-        ControlDependenceAnalysis locCDA(*acyclicDG->region);
-        auto depsMap = locCDA.getAllBlockDeps();
-        DenseSet<Block *> locConsControlDeps =
-            depsMap[acyclicDG->newCons].allControlDeps;
-
-        // 8. Enumerate paths to get the boolean expression for the backedges
-        // (i.e., condition is True if we are looping back)
-        BoolExpression *fBackedge =
-            enumeratePaths(*acyclicDG, bi, locConsControlDeps);       
-        fBackedge = fBackedge->boolMinimize();
-
-        // 9. Build BDD with topologically sorted cofactorList
-        std::set<std::string> vars = fBackedge->getVariables();
-
-        DenseMap<Block *, unsigned> rank;
-        unsigned ri = 0;
-        for (Block *b : acyclicDG->topoOrder)
-          if (auto *ob = acyclicDG->origMap.lookup(b))
-            rank[ob] = ri++;
-
-        std::vector<std::string> cofactorList;
-        cofactorList.reserve(vars.size());
-        std::vector<std::pair<unsigned, std::string>> tmp;
-        for (auto &var : vars)
-          if (auto blkOpt = bi.getBlockFromCondition(var))
-            if (rank.count(*blkOpt))
-              tmp.emplace_back(rank[*blkOpt], var);
-        llvm::sort(tmp, [](auto &a, auto &b) { return a.first < b.first; });
-        for (auto &p : tmp)
-          cofactorList.push_back(p.second);
-
-        BDD *bdd = buildBDD(fBackedge, cofactorList);
-        // 10. Convert to Circuit.
-        conditionValue =
-            bddToCircuit(rewriter, bdd, loopHeader, registry, {}, bi, pendingMuxOperands);
-
-        // Clean up temporary graphs
-        acyclicDG->containerOp->erase();
-        decisionGraph->containerOp->erase();
-        locGraph->containerOp->erase();
+        conditionValue = computeLoopBackedgeCondition(
+            rewriter, loopHeader, loopHeader, bi, pendingMuxOperands);
 
       } else {
         // [Gamma Logic]

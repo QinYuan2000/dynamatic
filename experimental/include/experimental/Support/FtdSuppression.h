@@ -311,6 +311,40 @@ void buildDistributionNetwork(mlir::OpBuilder &builder,
                               DenseMap<Value, SmallVector<Backedge, 2>> *pendingMuxOperands,
                               ShadowCFG *shadow = nullptr);
 
+/// Compute the topological rank of original blocks from a LocalCFG.
+/// Maps each original block (via origMap) to its index in topoOrder.
+DenseMap<Block *, unsigned> computeTopoRank(const LocalCFG &lcfg);
+
+/// Convert a boolean expression to a hardware mux-tree circuit.
+/// Handles the full pipeline: minimize → topo-sort cofactors → buildBDD →
+/// bddToCircuit. `varRank` maps original CFG blocks to their topological rank
+/// (determines BDD variable ordering).
+Value expressionToCircuit(
+    OpBuilder &builder, boolean::BoolExpression *expr,
+    const DenseMap<Block *, unsigned> &varRank,
+    Block *insertBlock, SignalRegistry &registry, const BlockIndexing &bi,
+    DenseMap<Value, SmallVector<Backedge, 2>> *pendingMuxOperands = nullptr,
+    ShadowCFG *shadow = nullptr, IntegerAttr forcedBBAttr = {});
+
+/// Convenience overload: computes varRank from a LocalCFG's topoOrder.
+Value expressionToCircuit(
+    OpBuilder &builder, boolean::BoolExpression *expr,
+    const LocalCFG &rankSource,
+    Block *insertBlock, SignalRegistry &registry, const BlockIndexing &bi,
+    DenseMap<Value, SmallVector<Backedge, 2>> *pendingMuxOperands = nullptr,
+    ShadowCFG *shadow = nullptr, IntegerAttr forcedBBAttr = {});
+
+/// Compute the loop backedge condition for a self-loop at loopHeader.
+/// Runs the full suppression pipeline for a header-to-header path:
+///   buildLocalCFGRegion → CDA → CyclicGraphManager → CyclicDemotionHelper →
+///   buildDistributionNetwork → enumeratePaths → expressionToCircuit.
+/// Returns the condition Value that is true when the loop iterates back.
+Value computeLoopBackedgeCondition(
+    OpBuilder &builder, Block *loopHeader, Block *insertBlock,
+    const BlockIndexing &bi,
+    DenseMap<Value, SmallVector<Backedge, 2>> *pendingMuxOperands = nullptr,
+    ShadowCFG *shadow = nullptr);
+
 // ===--------------------------------------------------------------------=== //
 // Top-level suppression entry point
 // ===--------------------------------------------------------------------=== //

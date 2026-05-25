@@ -35,7 +35,7 @@ using namespace dynamatic::experimental::boolean;
 
 
 // ===--------------------------------------------------------------------=== //
-// CyclicGraphManager implementation (from FtdCycleAnalysis)
+// CyclicGraphManager implementation
 // ===--------------------------------------------------------------------=== //
 
 CyclicGraphManager::CyclicGraphManager(LocalCFG &cfg)
@@ -1128,6 +1128,126 @@ void ftd::buildDistributionNetwork(mlir::OpBuilder &builder,
   }
 }
 
+// ===--------------------------------------------------------------------=== //
+// expressionToCircuit — unified BDD pipeline
+// ===--------------------------------------------------------------------=== //
+
+DenseMap<Block *, unsigned> ftd::computeTopoRank(const LocalCFG &lcfg) {
+  DenseMap<Block *, unsigned> rank;
+  unsigned i = 0;
+  for (Block *b : lcfg.topoOrder)
+    if (auto *ob = lcfg.origMap.lookup(b))
+      rank[ob] = i++;
+  return rank;
+}
+
+Value ftd::expressionToCircuit(
+    OpBuilder &builder, BoolExpression *expr,
+    const DenseMap<Block *, unsigned> &varRank,
+    Block *insertBlock, SignalRegistry &registry, const BlockIndexing &bi,
+    DenseMap<Value, SmallVector<Backedge, 2>> *pendingMuxOperands,
+    ShadowCFG *shadow, IntegerAttr forcedBBAttr) {
+
+  expr = expr->boolMinimize();
+  std::set<std::string> vars = expr->getVariables();
+
+  // Sort cofactors by topological rank
+  std::vector<std::pair<unsigned, std::string>> tmp;
+  tmp.reserve(vars.size());
+  for (auto &var : vars)
+    if (auto blkOpt = bi.getBlockFromCondition(var))
+      if (varRank.count(*blkOpt))
+        tmp.emplace_back(varRank.lookup(*blkOpt), var);
+  llvm::sort(tmp, [](auto &a, auto &b) { return a.first < b.first; });
+
+  std::vector<std::string> cofactorList;
+  cofactorList.reserve(tmp.size());
+  for (auto &p : tmp)
+    cofactorList.push_back(p.second);
+
+  BDD *bdd = buildBDD(expr, cofactorList);
+  return bddToCircuit(builder, bdd, insertBlock, registry, {}, bi,
+                      pendingMuxOperands, shadow, forcedBBAttr);
+}
+
+Value ftd::expressionToCircuit(
+    OpBuilder &builder, BoolExpression *expr,
+    const LocalCFG &rankSource,
+    Block *insertBlock, SignalRegistry &registry, const BlockIndexing &bi,
+    DenseMap<Value, SmallVector<Backedge, 2>> *pendingMuxOperands,
+    ShadowCFG *shadow, IntegerAttr forcedBBAttr) {
+  DenseMap<Block *, unsigned> rank = computeTopoRank(rankSource);
+  return expressionToCircuit(builder, expr, rank, insertBlock, registry, bi,
+                             pendingMuxOperands, shadow, forcedBBAttr);
+}
+
+// ===--------------------------------------------------------------------=== //
+// computeLoopBackedgeCondition — shared MU/regen pipeline
+// ===--------------------------------------------------------------------=== //
+
+Value ftd::computeLoopBackedgeCondition(
+    OpBuilder &builder, Block *loopHeader, Block *insertBlock,
+    const BlockIndexing &bi,
+    DenseMap<Value, SmallVector<Backedge, 2>> *pendingMuxOperands,
+    ShadowCFG *shadow) {
+
+  // 1. Build Local CFG with Prod = Cons = Loop Header (self-loop graph)
+  OpBuilder tmpBuilder(builder.getContext());
+  auto locGraph = buildLocalCFGRegion(tmpBuilder, loopHeader, loopHeader, bi);
+
+  // 2. CDA on raw graph to get full control deps
+  ControlDependenceAnalysis locCDATmp(*locGraph->region);
+  DenseSet<Block *> locConsControlDepsFull =
+      locCDATmp.getAllBlockDeps()[locGraph->newCons].allControlDeps;
+  DenseSet<Block *> locConsAcyclicDeps =
+      locCDATmp.getAllBlockDeps()[locGraph->newCons].allControlDeps;
+
+  // 3. Build full decision graph for CyclicGraphManager
+  auto fullDecisionGraph =
+      buildDecisionGraph(*locGraph, locConsControlDepsFull);
+  CyclicGraphManager cyclicMgr(*fullDecisionGraph);
+
+  // 4. Build origToFullDG map
+  DenseMap<Block *, Block *> origToFullDG;
+  for (auto [dgBlock, origBlock] : fullDecisionGraph->origMap)
+    if (origBlock)
+      origToFullDG[origBlock] = dgBlock;
+
+  // 5. Create cyclic demotion helper
+  CyclicDemotionHelper demotionHelper(
+      builder, builder.getContext(), bi, cyclicMgr, origToFullDG,
+      builder.getUnknownLoc(), insertBlock, pendingMuxOperands, shadow);
+
+  // 6. Build acyclic decision graph
+  auto acyclicDG = buildDecisionGraph(*locGraph, locConsAcyclicDeps);
+
+  // 7. Pre-register demoted values for high-level variables
+  SignalRegistry registry;
+  demotionHelper.preRegisterDemotedValues(acyclicDG, registry);
+
+  // 8. Construct distribution circuit
+  buildDistributionNetwork(builder, *acyclicDG, bi, registry,
+                           pendingMuxOperands, shadow);
+
+  // 9. CDA on acyclic DG
+  ControlDependenceAnalysis locCDA(*acyclicDG->region);
+  DenseSet<Block *> locConsControlDeps =
+      locCDA.getAllBlockDeps()[acyclicDG->newCons].allControlDeps;
+
+  // 10. Enumerate paths → expression → circuit
+  BoolExpression *fBackedge = enumeratePaths(*acyclicDG, bi, locConsControlDeps);
+  Value conditionValue =
+      expressionToCircuit(builder, fBackedge, *acyclicDG, insertBlock,
+                          registry, bi, pendingMuxOperands, shadow);
+
+  // 11. Clean up temporary graphs
+  acyclicDG->containerOp->erase();
+  fullDecisionGraph->containerOp->erase();
+  locGraph->containerOp->erase();
+
+  return conditionValue;
+}
+
 
 // ===--------------------------------------------------------------------=== //
 // LocalCFG and Decision Graph construction
@@ -1667,12 +1787,7 @@ Value CyclicDemotionHelper::demoteOneLevel(Value currentValue, Block *origBlock,
         }
 
         // Pre-compute DP rank before erasing
-        {
-          unsigned idx = 0;
-          for (Block *b : dpDG->topoOrder)
-            if (auto *ob = dpDG->origMap.lookup(b))
-              rankDP[ob] = idx++;
-        }
+        rankDP = computeTopoRank(*dpDG);
 
         dpDG->containerOp->erase();
       }
@@ -1685,51 +1800,16 @@ Value CyclicDemotionHelper::demoteOneLevel(Value currentValue, Block *origBlock,
       currentValue.setType(ftd::channelifyType(currentValue.getType()));
 
     if (fSup->type != experimental::boolean::ExpressionType::Zero) {
-      std::set<std::string> vars = fSup->getVariables();
-
-      // Sort cofactorList by levelCFG topological order
-      DenseMap<Block *, unsigned> rank;
-      unsigned i = 0;
-      for (Block *b : levelCFG->topoOrder)
-        if (auto *ob = levelCFG->origMap.lookup(b))
-          rank[ob] = i++;
-
-      std::vector<std::string> cofactorList;
-      cofactorList.reserve(vars.size());
-      std::vector<std::pair<unsigned, std::string>> tmp;
-      for (auto &var : vars)
-        if (auto blkOpt = bi.getBlockFromCondition(var))
-          if (rank.count(*blkOpt))
-            tmp.emplace_back(rank[*blkOpt], var);
-      llvm::sort(tmp, [](auto &a, auto &b) { return a.first < b.first; });
-      for (auto &p : tmp)
-        cofactorList.push_back(p.second);
-
-      BDD *bdd = buildBDD(fSup, cofactorList);
-      Value branchCond = bddToCircuit(builder, bdd, insertBlock,
-                                      levelRegistry, {}, bi,
-                                      pendingMuxOperands, shadow);
+      DenseMap<Block *, unsigned> rank = computeTopoRank(*levelCFG);
+      Value branchCond = expressionToCircuit(builder, fSup, rank, insertBlock,
+                                             levelRegistry, bi,
+                                             pendingMuxOperands, shadow);
 
       // Cascaded DP filter
       if (fSupDP->type != experimental::boolean::ExpressionType::Zero) {
-        std::set<std::string> dpVarsSet = fSupDP->getVariables();
-
-        // Sort dpCofactorList by DP graph topological order
-        std::vector<std::string> dpCofactorList;
-        dpCofactorList.reserve(dpVarsSet.size());
-        std::vector<std::pair<unsigned, std::string>> tmpDP;
-        for (auto &var : dpVarsSet)
-          if (auto blkOpt = bi.getBlockFromCondition(var))
-            if (rankDP.count(*blkOpt))
-              tmpDP.emplace_back(rankDP[*blkOpt], var);
-        llvm::sort(tmpDP, [](auto &a, auto &b) { return a.first < b.first; });
-        for (auto &p : tmpDP)
-          dpCofactorList.push_back(p.second);
-
-        BDD *dpBdd = buildBDD(fSupDP, dpCofactorList);
-        Value dpCond = bddToCircuit(builder, dpBdd, insertBlock,
-                                    levelRegistry, {}, bi,
-                                    pendingMuxOperands, shadow);
+        Value dpCond = expressionToCircuit(builder, fSupDP, rankDP, insertBlock,
+                                           levelRegistry, bi,
+                                           pendingMuxOperands, shadow);
         auto dpBranch = builder.create<handshake::ConditionalBranchOp>(
             loc, ftd::getListTypes(branchCond.getType()),
             dpCond, branchCond);
@@ -2342,23 +2422,14 @@ void ftd::insertDirectSuppression(
       }
 
       // Pre-compute DP rank before erasing
-      {
-        unsigned idx = 0;
-        for (Block *b : dpFullDG->topoOrder)
-          if (auto *ob = dpFullDG->origMap.lookup(b))
-            rankDP[ob] = idx++;
-      }
+      rankDP = computeTopoRank(*dpFullDG);
 
       dpFullDG->containerOp->erase();
     }
 
     // Pre-compute DP rank from locGraphDP as fallback if dpFullDG was not built
-    if (rankDP.empty()) {
-      unsigned idx = 0;
-      for (Block *b : locGraphDP->topoOrder)
-        if (auto *ob = locGraphDP->origMap.lookup(b))
-          rankDP[ob] = idx++;
-    }
+    if (rankDP.empty())
+      rankDP = computeTopoRank(*locGraphDP);
 
     locGraphDP->containerOp->erase();
   }
@@ -2373,53 +2444,17 @@ void ftd::insertDirectSuppression(
   // If the activation function is not zero, then a suppress block is to be
   // inserted
   if (fSup->type != experimental::boolean::ExpressionType::Zero) {
-    std::set<std::string> blocks = fSup->getVariables();
-    DenseMap<Block *, unsigned> rank;
-    unsigned i = 0;
-    for (Block *b : locGraph->topoOrder)
-      if (auto *ob = locGraph->origMap.lookup(b))
-        rank[ob] = i++;
-
-    std::vector<std::string> cofactorList;
-    cofactorList.reserve(blocks.size());
-    std::vector<std::pair<unsigned, std::string>> tmp;
-    for (auto &var : blocks)
-      if (auto blkOpt = bi.getBlockFromCondition(var))
-        if (rank.count(*blkOpt))
-          tmp.emplace_back(rank[*blkOpt], var);
-    llvm::sort(tmp, [](auto &a, auto &b) { return a.first < b.first; });
-    for (auto &p : tmp)
-      cofactorList.push_back(p.second);
-
-    // llvm::errs() << "[CofactorList] ";
-    // for (const auto &s : cofactorList)
-    //   llvm::errs() << s << " ";
-    // llvm::errs() << "\n";
-    BDD *bdd = buildBDD(fSup, cofactorList);
     IntegerAttr connectionBBAttr = targetBBAttr;
+    DenseMap<Block *, unsigned> rank = computeTopoRank(*locGraph);
     Value branchCond =
-        bddToCircuit(builder, bdd, producerIRBlock, registry, {}, bi,
-                     nullptr, &shadow, connectionBBAttr);
+        expressionToCircuit(builder, fSup, rank, producerIRBlock,
+                            registry, bi, nullptr, &shadow, connectionBBAttr);
 
     // Cascaded Upstream Filter
     if (fSupDP->type != experimental::boolean::ExpressionType::Zero) {
-      std::set<std::string> blocksDP = fSupDP->getVariables();
-
-      std::vector<std::string> cofactorListDP;
-      cofactorListDP.reserve(blocksDP.size());
-      std::vector<std::pair<unsigned, std::string>> tmpDP;
-      for (auto &var : blocksDP)
-        if (auto blkOpt = bi.getBlockFromCondition(var))
-          if (rankDP.count(*blkOpt))
-            tmpDP.emplace_back(rankDP[*blkOpt], var);
-      llvm::sort(tmpDP, [](auto &a, auto &b) { return a.first < b.first; });
-      for (auto &p : tmpDP)
-        cofactorListDP.push_back(p.second);
-
-      BDD *bddDP = buildBDD(fSupDP, cofactorListDP);
       Value dpBranchCond =
-          bddToCircuit(builder, bddDP, producerIRBlock, registry, {}, bi,
-                       nullptr, &shadow, connectionBBAttr);
+          expressionToCircuit(builder, fSupDP, rankDP, producerIRBlock,
+                              registry, bi, nullptr, &shadow, connectionBBAttr);
 
       // Upstream logic filters the SUPPRESSION SIGNAL.
       // Create an Intermediate Branch on the 'branchCond' wire.
