@@ -10,6 +10,10 @@
 // according to the original FPGA'22 paper by Elakhras et al.
 // (https://ieeexplore.ieee.org/document/10035134).
 //
+// This file contains the top-level algorithm orchestration (GSA conversion,
+// regeneration, suppression dispatch, phi networks). The suppression circuit
+// construction infrastructure lives in FtdSuppression.h.
+//
 //===----------------------------------------------------------------------===//
 
 #ifndef DYNAMATIC_SUPPORT_FTD_IMPLEMENTATION_H
@@ -18,58 +22,14 @@
 #include "dynamatic/Dialect/Handshake/HandshakeOps.h"
 #include "dynamatic/Support/Backedge.h"
 #include "experimental/Analysis/GSAAnalysis.h"
+#include "experimental/Support/FtdSupport.h"
 #include "mlir/Dialect/Func/IR/FuncOps.h"
 
 namespace dynamatic {
 namespace experimental {
 namespace ftd {
 
-/// A temporary shadow of the original CFG, built after CfToHandshake
-/// conversion flattens everything.  Encapsulates the shadow Region
-/// (with real CF terminators) plus a condition-value map that bridges
-/// shadow analysis to real handshake Values.
-///
-/// All analysis infrastructure (BlockIndexing, CFGLoopInfo, path
-/// enumeration, dominance) operates on getRegion() as if the original
-/// CFG were still alive.  The only thing the shadow cannot provide
-/// natively is the real handshake condition Value for each cond_br
-/// block — getCondition() provides that.
-struct ShadowCFG {
-  mlir::func::FuncOp shadowFunc;
-  llvm::DenseMap<unsigned, mlir::Value> conditionMap;
-
-  mlir::Region &getRegion() { return shadowFunc.getBody(); }
-
-  mlir::Block *getBlock(unsigned bbIdx) {
-    for (auto [i, blk] : llvm::enumerate(getRegion()))
-      if (i == bbIdx)
-        return &blk;
-    llvm_unreachable("BB index out of range in shadow CFG");
-  }
-
-  unsigned getBlockIndex(mlir::Block *block) {
-    for (auto [i, blk] : llvm::enumerate(getRegion()))
-      if (&blk == block)
-        return i;
-    llvm_unreachable("Block not found in shadow CFG");
-  }
-
-  /// Get the real handshake condition Value for the cond_br in block bbIdx.
-  /// Returns nullptr if the block had an unconditional branch.
-  mlir::Value getCondition(unsigned bbIdx) {
-    auto it = conditionMap.find(bbIdx);
-    return (it != conditionMap.end()) ? it->second : nullptr;
-  }
-
-  mlir::Value getCondition(mlir::Block *block) {
-    return getCondition(getBlockIndex(block));
-  }
-
-  void destroy() {
-    if (shadowFunc)
-      shadowFunc.erase();
-  }
-};
+// ShadowCFG is declared in FtdSupport.h
 
 /// Create SourceOp condition placeholders for every conditional block in the
 /// region. Must be called before addGsaGates.

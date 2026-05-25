@@ -6,8 +6,8 @@ add_dynamatic_library(DynamaticExperimentalSupport
   StdProfiler.cpp
   HandshakeSimulator.cpp
   FtdImplementation.cpp
-  FtdCycleAnalysis.cpp
   FtdSupport.cpp
+  FtdSuppression.cpp
   CFGAnnotation.cpp
   FormalProperty.cpp
 

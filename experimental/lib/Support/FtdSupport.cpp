@@ -6,9 +6,8 @@
 //
 //===----------------------------------------------------------------------===//
 //
-// Implements some utility functions which are useful for both the fast token
-// delivery algorithm and for the GSA analysis pass. All the functions are about
-// analyzing relationships between blocks and handshake operations.
+// Implements utility functions shared across the FTD algorithm: CFG analysis,
+// type helpers, IR attribute utilities, and condition placeholders.
 //
 //===----------------------------------------------------------------------===//
 
@@ -21,6 +20,10 @@
 using namespace mlir;
 using namespace dynamatic;
 using namespace dynamatic::experimental;
+
+// ===--------------------------------------------------------------------=== //
+// BlockIndexing
+// ===--------------------------------------------------------------------=== //
 
 std::string ftd::BlockIndexing::getBlockCondition(Block *block) const {
   return "c" + std::to_string(getIndexFromBlock(block).value_or(0));
@@ -90,6 +93,10 @@ bool ftd::BlockIndexing::isLess(Block *bb1, Block *bb2) const {
   return index1 < index2;
 }
 
+// ===--------------------------------------------------------------------=== //
+// Loop analysis utilities
+// ===--------------------------------------------------------------------=== //
+
 /// Recursively check whether 2 blocks belong to the same loop, starting
 /// from the inner-most loops.
 static bool isSameLoop(const CFGLoop *loop1, const CFGLoop *loop2) {
@@ -117,6 +124,10 @@ bool ftd::isSameOrInnerLoopBlocks(Block *source, Block *dest,
                                   const mlir::CFGLoopInfo &li) {
   return isSameOrInnerLoop(li.getLoopFor(source), li.getLoopFor(dest));
 }
+
+// ===--------------------------------------------------------------------=== //
+// Path finding
+// ===--------------------------------------------------------------------=== //
 
 /// Recursive function which allows to obtain all the paths from block `start`
 /// to block `end` using a DFS.
@@ -182,6 +193,10 @@ ftd::findAllPaths(Block *start, Block *end, const BlockIndexing &bi,
   return allPaths;
 }
 
+// ===--------------------------------------------------------------------=== //
+// Path expression generation
+// ===--------------------------------------------------------------------=== //
+
 boolean::BoolExpression *
 ftd::getPathExpression(ArrayRef<Block *> path,
                        DenseSet<unsigned> &blockIndexSet,
@@ -239,6 +254,39 @@ ftd::getPathExpression(ArrayRef<Block *> path,
   return exp;
 }
 
+// ===--------------------------------------------------------------------=== //
+// Reachability
+// ===--------------------------------------------------------------------=== //
+
+bool ftd::isReachable(Block *start, Block *end) {
+  if (start == end)
+    return true;
+
+  DenseSet<Block *> visited;
+  SmallVector<Block *, 8> stack;
+  stack.push_back(start);
+  visited.insert(start);
+
+  while (!stack.empty()) {
+    Block *curr = stack.pop_back_val();
+
+    if (curr == end)
+      return true;
+
+    for (Block *succ : curr->getSuccessors()) {
+      if (!visited.count(succ)) {
+        visited.insert(succ);
+        stack.push_back(succ);
+      }
+    }
+  }
+  return false;
+}
+
+// ===--------------------------------------------------------------------=== //
+// Type utilities
+// ===--------------------------------------------------------------------=== //
+
 Type ftd::channelifyType(Type type) {
   return llvm::TypeSwitch<Type, Type>(type)
       .Case<IndexType, IntegerType, FloatType>(
@@ -258,4 +306,59 @@ Type ftd::channelifyType(Type type) {
 
 SmallVector<Type> ftd::getListTypes(Type inputType, unsigned size) {
   return SmallVector<Type>(size, channelifyType(inputType));
+}
+
+// ===--------------------------------------------------------------------=== //
+// IR attribute utilities
+// ===--------------------------------------------------------------------=== //
+
+void ftd::setBBAttr(Operation *op, Block *block, OpBuilder &builder) {
+  unsigned idx = 0;
+  for (Block &blk : *block->getParent()) {
+    if (&blk == block)
+      break;
+    idx++;
+  }
+  op->setAttr("handshake.bb",
+              IntegerAttr::get(IntegerType::get(builder.getContext(), 32,
+                                                IntegerType::Unsigned),
+                               idx));
+}
+
+void ftd::setBBAttr(Operation *op, IntegerAttr bbAttr) {
+  if (bbAttr)
+    op->setAttr("handshake.bb", bbAttr);
+}
+
+void ftd::setBBAttrWithFallback(Operation *op, IntegerAttr bbAttr,
+                                Block *block, OpBuilder &builder) {
+  if (bbAttr)
+    return setBBAttr(op, bbAttr);
+  setBBAttr(op, block, builder);
+}
+
+// ===--------------------------------------------------------------------=== //
+// Condition placeholder
+// ===--------------------------------------------------------------------=== //
+
+Value ftd::getOrCreateCondPlaceholder(Block *condBlock, OpBuilder &builder) {
+  for (Operation &op : *condBlock) {
+    if (isa<handshake::ConstantOp>(&op) && op.hasAttr(FTD_COND_VAR))
+      return op.getResult(0);
+  }
+  OpBuilder::InsertionGuard guard(builder);
+  builder.setInsertionPointToStart(condBlock);
+  auto sourceOp =
+      builder.create<handshake::SourceOp>(builder.getUnknownLoc());
+  sourceOp->setAttr(FTD_OP_TO_SKIP, builder.getUnitAttr());
+  setBBAttr(sourceOp, condBlock, builder);
+
+  auto cstAttr = builder.getIntegerAttr(builder.getIntegerType(1), 0);
+  auto constOp = builder.create<handshake::ConstantOp>(
+      builder.getUnknownLoc(), cstAttr, sourceOp.getResult());
+  constOp->setAttr(FTD_COND_VAR, builder.getUnitAttr());
+  constOp->setAttr(FTD_OP_TO_SKIP, builder.getUnitAttr());
+  setBBAttr(constOp, condBlock, builder);
+
+  return constOp.getResult();
 }
