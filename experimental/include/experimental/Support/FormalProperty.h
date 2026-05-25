@@ -37,6 +37,8 @@ public:
     IOGConsecutiveTokens,
     EntryTokenOrder,
     SingleEntryToken,
+    ExitTokenOrder,
+    ExitTokenNoAncestors,
   };
 
   TAG getTag() const { return tag; }
@@ -462,6 +464,114 @@ private:
   std::vector<EffectiveSlotNamer> cm;
   inline static const StringLiteral PATH_EC_LIT = "entry_cmerge_path";
   inline static const StringLiteral PATH_CM_LIT = "cmerge_mux_path";
+};
+
+// In a path between a decider unit and a branch, only the first token along the
+// path can have the value that exits the loop. This is because, after the exit
+// token is generated, control flow will never come back to the decider unit
+// again, so no new token will be propagated into the path.
+// A unit is a decider unit if:
+// 1. It generates a token with a new value used as the condition by one or more
+// branches
+// 2. At least one of the branches is part of an IOG, and only one of the output
+// paths of this branch loops back to the branch
+class ExitTokenOrder : public FormalProperty {
+public:
+  const std::vector<EffectiveSlotNamer> &getSlots() const { return slots; }
+  int32_t getValue() const { return exitValue; }
+  llvm::json::Value extraInfoToJSON() const override;
+  static std::unique_ptr<ExitTokenOrder>
+  fromJSON(const llvm::json::Value &value, llvm::json::Path path);
+  ExitTokenOrder() = default;
+  ExitTokenOrder(unsigned long id, TAG tag,
+                 std::vector<EffectiveSlotNamer> slots, int32_t value)
+      : FormalProperty(id, tag, TYPE::ExitTokenOrder), slots(std::move(slots)),
+        exitValue(value) {}
+  ~ExitTokenOrder() = default;
+
+  static bool classof(const FormalProperty *fp) {
+    return fp->getType() == TYPE::ExitTokenOrder;
+  }
+
+private:
+  std::vector<EffectiveSlotNamer> slots;
+  int32_t exitValue;
+  inline static const StringLiteral SLOTS_LIT = "slots";
+  inline static const StringLiteral EXIT_VALUE_LIT = "exit_value";
+};
+
+// The ExitTokenNoAncestors invariant states that, for any decider-branch path,
+// if an exit token exists anywhere, ancestors of the decider cannot contain any
+// effective tokens. Any unit that can reach the decider is called an ancestor
+// of the decider.
+//
+// The following graphic should assist in understanding what ancestor slots are,
+// and visualize the terminology used in the search algorithm.
+// ```
+// EffectiveSlot            --|--|
+// ...                        |  |
+// EffectiveSlot              |  | Ancestor slots
+//                            |  |
+// Slot                       |--|
+// EagerFork                  |
+// ...                        | Effective Ancestors
+// EagerFork                  |
+//                            |
+//                            |
+// Decider (e.g. <)           |  --|
+//                            |    | Unstarted path
+//                            |    |
+// EagerFork   --|            |    |
+// ...           | startSents |    |
+// EagerFork   --|          --|    |
+//                                 |
+// EffectiveSlot    --|            |--|
+// ...                | DecBrPath  |  |
+// EffectiveSlot      |            |  | Started path
+//                    |            |  |
+// ExitBranch       --|          --|--|
+// ```
+//
+// The reason for the complicated search algorithm is due to the edge cases of
+// eager forks, and due to the presence of multiple possible paths: There might
+// be multiple paths of ancestors before the decider, and there are multiple
+// paths to exit branches after the decider. However, to get the effective path
+// of ancestors, the forks labelled `startSents` are still required, as they are
+// copied sents of the last ancestor.
+class ExitTokenNoAncestors : public FormalProperty {
+public:
+  const std::vector<std::shared_ptr<InternalStateNamer>> &getExitSlots() const {
+    return exitSlots;
+  }
+  const std::vector<EffectiveSlotNamer> &getAncestors() const {
+    return ancestors;
+  }
+  int32_t getValue() const { return exitValue; }
+
+  llvm::json::Value extraInfoToJSON() const override;
+  static std::unique_ptr<ExitTokenNoAncestors>
+  fromJSON(const llvm::json::Value &value, llvm::json::Path path);
+  ExitTokenNoAncestors() = default;
+  ExitTokenNoAncestors(
+      unsigned long id, TAG tag,
+      std::vector<std::shared_ptr<InternalStateNamer>> exitSlots,
+      std::vector<EffectiveSlotNamer> ancestors, int32_t value)
+      : FormalProperty(id, tag, TYPE::ExitTokenNoAncestors),
+        exitSlots(std::move(exitSlots)), ancestors(std::move(ancestors)),
+        exitValue(value) {}
+  ~ExitTokenNoAncestors() = default;
+
+  static bool classof(const FormalProperty *fp) {
+    return fp->getType() == TYPE::ExitTokenNoAncestors;
+  }
+
+private:
+  std::vector<std::shared_ptr<InternalStateNamer>> exitSlots;
+  std::vector<EffectiveSlotNamer> ancestors;
+  int32_t exitValue;
+  inline static const StringLiteral EXIT_SLOTS_LIT = "exit_slots";
+  inline static const StringLiteral ANCESTORS_LIT = "ancestors";
+  inline static const StringLiteral EXIT_VALUE_LIT = "exit_value";
 };
 
 class FormalPropertyTable {

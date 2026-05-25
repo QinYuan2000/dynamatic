@@ -1383,6 +1383,46 @@ LogicalResult SMVWriter::createProperties(WriteModData &data) const {
           llvm::formatv("count({0}) > 0 -> count({1}) = 0",
                         llvm::join(cmStrs, ", "), llvm::join(ecStrs, ", "));
       data.properties[p->getId()] = {propertyString, propertyTag};
+    } else if (auto *p = llvm::dyn_cast<ExitTokenOrder>(property.get())) {
+      // (buffer3.full & buffer3.data = exit) -> (!buffer1.full & !buffer2.full)
+      const auto &slots = p->getSlots();
+      assert(slots.size() >= 2);
+      std::vector<std::string> earlierSlots;
+      std::vector<std::string> ends{};
+      earlierSlots.push_back(
+          llvm::formatv("!({0})", slots.begin()->getSMVName()));
+      for (auto start = slots.begin() + 1; start != slots.end(); ++start) {
+        std::string exitToken = start->constrain(p->getValue())->getSMVName();
+        ends.push_back(llvm::formatv("(({0}) -> ({1}))", exitToken,
+                                     llvm::join(earlierSlots, " & ")));
+        earlierSlots.push_back(llvm::formatv("!({0})", start->getSMVName()));
+      }
+
+      std::string propertyString = llvm::join(ends, " & ");
+      data.properties[p->getId()] = {propertyString, propertyTag};
+    } else if (auto *p = llvm::dyn_cast<ExitTokenNoAncestors>(property.get())) {
+      const auto &exitSlots = p->getExitSlots();
+      int32_t exitValue = p->getValue();
+      std::vector<std::string> exitFulls;
+      exitFulls.reserve(exitSlots.size());
+      for (const auto &exitSlot : exitSlots) {
+        auto name = exitSlot->tryConstrain(exitValue)->getSMVName();
+        exitFulls.push_back(name);
+      }
+      std::string left =
+          llvm::formatv("count({0}) > 0", llvm::join(exitFulls, ", "));
+
+      const auto &ancestors = p->getAncestors();
+      std::vector<std::string> ancestorSlots;
+      ancestorSlots.reserve(ancestors.size());
+      for (const auto &slot : ancestors) {
+        auto name = slot.getSMVName();
+        ancestorSlots.push_back(name);
+      }
+      std::string right =
+          llvm::formatv("count({0}) = 0", llvm::join(ancestorSlots, ", "));
+      std::string propertyString = llvm::formatv("({0}) -> ({1})", left, right);
+      data.properties[p->getId()] = {propertyString, propertyTag};
     } else {
       llvm::errs() << "Formal property Type not known\n";
       return failure();
