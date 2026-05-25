@@ -26,6 +26,9 @@
 #include "mlir/Dialect/MemRef/IR/MemRef.h"
 #include "mlir/IR/BuiltinOps.h"
 #include "mlir/Transforms/DialectConversion.h"
+#include "llvm/Support/Debug.h"
+
+#define DEBUG_TYPE "ftd-suppression"
 
 using namespace mlir;
 using namespace dynamatic;
@@ -1893,18 +1896,6 @@ void ftd::insertDirectSuppression(
     targetBBAttr = loopExitBBAttr;
   Block *dominatorBlock = producerBlock;
 
-  bool debuglog = false;
-  bool debugGraphDump = false;
-  // std::string funcName = funcOp.getName().str();
-  // std::string dir = "/home/username/dynamatic-scripts/Outputs/";
-  // std::string logFile = dir + funcName + "_debuglog.txt";
-  // std::error_code EC_log;
-  // llvm::raw_fd_ostream log(logFile, EC_log,
-  //                          static_cast<llvm::sys::fs::OpenFlags>(0x0004));
-  // llvm::raw_ostream &out = EC_log ? llvm::errs() : log;
-  llvm::raw_ostream &out = llvm::errs();
-
-
   // Helper: translate a local block to a readable orig-block name
   auto blockName = [](const ftd::LocalCFG &cfg, Block *b) -> std::string {
     if (!b)
@@ -1926,23 +1917,22 @@ void ftd::insertDirectSuppression(
     return "local(" + ss.str() + ")";
   };
 
-  // Concise topology dump: roles, topo order, and edges in orig-block names
+  // Concise topology dump: roles, topo order, and edges in orig-block names.
+  // Always called inside LLVM_DEBUG(), so no guard needed.
   auto dumpLocalCFG = [&](const ftd::LocalCFG &cfg, llvm::StringRef name) {
-    if (!debugGraphDump)
-      return;
-    out << "===== " << name << " =====\n";
-    out << "  prod=" << blockName(cfg, cfg.newProd)
+    llvm::dbgs() << "===== " << name << " =====\n";
+    llvm::dbgs() << "  prod=" << blockName(cfg, cfg.newProd)
         << "  cons=" << blockName(cfg, cfg.newCons)
         << "  sink=" << blockName(cfg, cfg.sinkBB);
     if (cfg.secondVisitBB)
-      out << "  secondVisit=" << blockName(cfg, cfg.secondVisitBB);
-    out << "\n  topo: ";
+      llvm::dbgs() << "  secondVisit=" << blockName(cfg, cfg.secondVisitBB);
+    llvm::dbgs() << "\n  topo: ";
     for (unsigned i = 0; i < cfg.topoOrder.size(); ++i) {
       if (i > 0)
-        out << " -> ";
-      out << blockName(cfg, cfg.topoOrder[i]);
+        llvm::dbgs() << " -> ";
+      llvm::dbgs() << blockName(cfg, cfg.topoOrder[i]);
     }
-    out << "\n  edges:\n";
+    llvm::dbgs() << "\n  edges:\n";
     if (cfg.region) {
       for (Block *b : cfg.topoOrder) {
         Operation *term = b->getTerminator();
@@ -1950,18 +1940,18 @@ void ftd::insertDirectSuppression(
           continue;
         std::string src = blockName(cfg, b);
         if (auto condBr = dyn_cast<cf::CondBranchOp>(term)) {
-          out << "    " << src
+          llvm::dbgs() << "    " << src
               << " -T-> " << blockName(cfg, condBr.getTrueDest())
               << ", -F-> " << blockName(cfg, condBr.getFalseDest()) << "\n";
         } else {
           for (unsigned i = 0; i < term->getNumSuccessors(); ++i) {
-            out << "    " << src
+            llvm::dbgs() << "    " << src
                 << " -> " << blockName(cfg, term->getSuccessor(i)) << "\n";
           }
         }
       }
     }
-    out << "\n";
+    llvm::dbgs() << "\n";
   };
 
   // Account for the condition of a Mux only if it corresponds to a GAMMA GSA
@@ -1972,21 +1962,20 @@ void ftd::insertDirectSuppression(
                          connection.getDefiningOp()->hasAttr(FTD_EXPLICIT_MU));
 
   // Activate graph dumps when deliverToGamma is true (user-adjustable)
-  // debugGraphDump = deliverToGamma;
 
-  if (debuglog) {
-    out << "[FTD] Producer block: ";
+  LLVM_DEBUG({
+    llvm::dbgs() << "[FTD] Producer block: ";
     if (producerBlock)
-      producerBlock->printAsOperand(out);
+      producerBlock->printAsOperand(llvm::dbgs());
     else
-      out << "(null)";
-    out << ", Consumer block: ";
+      llvm::dbgs() << "(null)";
+    llvm::dbgs() << ", Consumer block: ";
     if (consumerBlock)
-      consumerBlock->printAsOperand(out);
+      consumerBlock->printAsOperand(llvm::dbgs());
     else
-      out << "(null)";
-    out << "\n";
-  }
+      llvm::dbgs() << "(null)";
+    llvm::dbgs() << "\n";
+  });
 
   // If producer is unreachable, the suppression is not needed.
   if (!isReachable(entryBlock, producerBlock)) {
@@ -2077,12 +2066,12 @@ void ftd::insertDirectSuppression(
     dominatorBlock = lastValidDominator;
   }
 
-  if (debuglog && deliverToGamma) {
-    out << "[FTD] Another Dominator block: ";
+  LLVM_DEBUG(if (deliverToGamma) {
+    llvm::dbgs() << "[FTD] Another Dominator block: ";
     if (dominatorBlock)
-      dominatorBlock->printAsOperand(out);
-    out << "\n";
-  }
+      dominatorBlock->printAsOperand(llvm::dbgs());
+    llvm::dbgs() << "\n";
+  });
 
   // Create a temporary builder to isolate the LocalCFG creation from the
   // main OpBuilder. This prevents the OpBuilder from tracking the
@@ -2091,7 +2080,7 @@ void ftd::insertDirectSuppression(
   auto locGraph =
       buildLocalCFGRegion(tmpBuilder, dominatorBlock, consumerBlock, bi);
 
-  dumpLocalCFG(*locGraph, "locGraph (Dominator -> Consumer)");
+  LLVM_DEBUG(dumpLocalCFG(*locGraph, "locGraph (Dominator -> Consumer)"));
 
   ControlDependenceAnalysis locCDA(*locGraph->region);
   // Full Set: contains consumer dependences, Mux Conditions and their
@@ -2132,22 +2121,20 @@ void ftd::insertDirectSuppression(
       }
 
       if (isDataInput) {
-        if (debuglog) {
-          out << "[MUX] Mux Condition Block: ";
-          Block *muxConditionBlock =
+        LLVM_DEBUG({
+          llvm::dbgs() << "[MUX] Mux Condition Block: ";
+          Block *muxCondBlock =
               returnMuxConditionBlock(currentMuxOp->getOperand(0), shadow);
-          if (muxConditionBlock)
-            muxConditionBlock->printAsOperand(out);
+          if (muxCondBlock)
+            muxCondBlock->printAsOperand(llvm::dbgs());
           else
-            out << "(null)";
-          out << "\n";
-
-          if (!requiredVal) {
-            out << "      Negated : (false input Selected)\n";
-          } else {
-            out << "      Original: (true input Selected)\n";
-          }
-        }
+            llvm::dbgs() << "(null)";
+          llvm::dbgs() << "\n";
+          if (!requiredVal)
+            llvm::dbgs() << "      Negated : (false input Selected)\n";
+          else
+            llvm::dbgs() << "      Original: (true input Selected)\n";
+        });
         // 1. Get the condition value driving this Mux
         Value muxCondition = currentMuxOp->getOperand(0);
 
@@ -2230,14 +2217,11 @@ void ftd::insertDirectSuppression(
       }
 
       if (nextMuxOp) {
-        if (debuglog) {
-          out << "    -> Found Cascaded Gamma Mux:\n";
-        }
+        LLVM_DEBUG(llvm::dbgs() << "    -> Found Cascaded Gamma Mux:\n");
         currentMuxOp = nextMuxOp;
       } else {
         isChainActive = false;
-        if (debuglog)
-          out << "    -> End of Gamma Mux Chain.\n";
+        LLVM_DEBUG(llvm::dbgs() << "    -> End of Gamma Mux Chain.\n");
       }
     }
   }
@@ -2284,7 +2268,7 @@ void ftd::insertDirectSuppression(
   auto fullDecisionGraph =
       buildDecisionGraph(*locGraph, locConsControlDepsFull);
 
-  dumpLocalCFG(*fullDecisionGraph, "fullDecisionGraph (locGraph + FullDeps)");
+  LLVM_DEBUG(dumpLocalCFG(*fullDecisionGraph, "fullDecisionGraph (locGraph + FullDeps)"));
 
   // Cycle Analysis Integration
   ftd::CyclicGraphManager cyclicMgr(*fullDecisionGraph);
@@ -2307,7 +2291,7 @@ void ftd::insertDirectSuppression(
   auto level0CFG = cyclicMgr.extractLayeredCFG(
       cyclicMgr.getTopLevelScope(), level0Builder);
 
-  dumpLocalCFG(*level0CFG, "level0CFG (Acyclic Layered from fullDG)");
+  LLVM_DEBUG(dumpLocalCFG(*level0CFG, "level0CFG (Acyclic Layered from fullDG)"));
 
   // CDA on the acyclic level 0 CFG — allControlDeps == forwardControlDeps
   // because the graph is a DAG.
@@ -2346,7 +2330,7 @@ void ftd::insertDirectSuppression(
   // Level 0: distribution graph (unconstrained, covers all paths)
   auto level0FullDG = buildDecisionGraph(*level0CFG, level0Deps);
 
-  dumpLocalCFG(*level0FullDG, "level0FullDG (level0CFG + Deps)");
+  LLVM_DEBUG(dumpLocalCFG(*level0FullDG, "level0FullDG (level0CFG + Deps)"));
 
   // Pre-register demoted values for high-level variables in level 0
   demotionHelper.preRegisterDemotedValues(level0FullDG, registry);
@@ -2358,19 +2342,19 @@ void ftd::insertDirectSuppression(
   auto level0ConstrainedDG =
       buildDecisionGraph(*level0CFG, level0Deps, level0MuxConstraints);
 
-  dumpLocalCFG(*level0ConstrainedDG,
-               "level0ConstrainedDG (level0CFG + muxConstraints)");
+  LLVM_DEBUG(dumpLocalCFG(*level0ConstrainedDG,
+               "level0ConstrainedDG (level0CFG + muxConstraints)"));
 
-  if (debugGraphDump && !muxConstraints.empty()) {
-    out << "  muxConstraints (" << muxConstraints.size() << "):\n";
+  LLVM_DEBUG(if (!muxConstraints.empty()) {
+    llvm::dbgs() << "  muxConstraints (" << muxConstraints.size() << "):\n";
     for (auto &entry : muxConstraints) {
-      out << "    ";
+      llvm::dbgs() << "    ";
       if (entry.first)
-        entry.first->printAsOperand(out);
-      out << " requires " << (entry.second ? "TRUE" : "FALSE") << "\n";
+        entry.first->printAsOperand(llvm::dbgs());
+      llvm::dbgs() << " requires " << (entry.second ? "TRUE" : "FALSE") << "\n";
     }
-    out << "\n";
-  }
+    llvm::dbgs() << "\n";
+  });
 
   ControlDependenceAnalysis decCDA(*level0ConstrainedDG->region);
   DenseSet<Block *> constrainedDeps =
@@ -2380,15 +2364,11 @@ void ftd::insertDirectSuppression(
       enumeratePaths(*level0ConstrainedDG, bi, constrainedDeps);
 
   fCons = fCons->boolMinimize();
-  if (debuglog) {
-    out << "fCons  = " << fCons->toString() << "\n";
-  }
+  LLVM_DEBUG(llvm::dbgs() << "fCons  = " << fCons->toString() << "\n");
   // f_supp = f_prod and not f_cons
   BoolExpression *fSup = fCons->boolNegate();
   fSup = fSup->boolMinimize();
-  if (debuglog) {
-    out << "fSupmin  = " << fSup->toString() << "\n\n\n";
-  }
+  LLVM_DEBUG(llvm::dbgs() << "fSupmin  = " << fSup->toString() << "\n\n");
 
   // Suppression Logic between Dominator and Producer (locGraphDP)
   BoolExpression *fSupDP = BoolExpression::boolZero();
@@ -2399,7 +2379,7 @@ void ftd::insertDirectSuppression(
     auto locGraphDP = buildLocalCFGRegion(tmpBuilder2, dominatorBlock,
                                           producerBlock, bi);
 
-    dumpLocalCFG(*locGraphDP, "locGraphDP (Dominator -> Producer)");
+    LLVM_DEBUG(dumpLocalCFG(*locGraphDP, "locGraphDP (Dominator -> Producer)"));
 
     if (locGraphDP->newCons) {
       // Build fullDecisionGraph for DP path
@@ -2408,7 +2388,7 @@ void ftd::insertDirectSuppression(
           dpLocCDA.getAllBlockDeps()[locGraphDP->newCons].allControlDeps;
       auto dpFullDG = buildDecisionGraph(*locGraphDP, dpDepsTmp);
 
-      dumpLocalCFG(*dpFullDG, "dpFullDG (locGraphDP + dpDeps)");
+      LLVM_DEBUG(dumpLocalCFG(*dpFullDG, "dpFullDG (locGraphDP + dpDeps)"));
 
       ControlDependenceAnalysis finalDpCDA(*dpFullDG->region);
       DenseSet<Block *> dpDeps =
@@ -2416,10 +2396,7 @@ void ftd::insertDirectSuppression(
 
       BoolExpression *fConsDP = enumeratePaths(*dpFullDG, bi, dpDeps);
       fSupDP = fConsDP->boolMinimize()->boolNegate()->boolMinimize();
-
-      if (debuglog) {
-        out << "fSupDP   = " << fSupDP->toString() << "\n\n\n";
-      }
+      LLVM_DEBUG(llvm::dbgs() << "fSupDP   = " << fSupDP->toString() << "\n\n");
 
       // Pre-compute DP rank before erasing
       rankDP = computeTopoRank(*dpFullDG);
