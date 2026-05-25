@@ -373,14 +373,33 @@ static ExtWidth addWidth(ExtWidth lhs, ExtWidth rhs) {
 
 /// Transfer function for sub operations or alike.
 static ExtWidth subWidth(ExtWidth lhs, ExtWidth rhs) {
-  // Subtraction logic can be broken down using other operations as follows:
-  // sub(a, b) = add(a, ~b + 1) = add(a, xor(b, sext(-1)) + 1)
-  // Applying the forward function from 'xor' we can conclude that rhs is
-  // always sign-extended if reduced in bitwidth.
+  // Proof for correctness of bitwidth and sign-extension:
+  // Case 1: Both operands are ZEXT:
+  // When both operands are zext their range is limited to be 0 to
+  // 2^b - 1 where b is their respective bitwidths.
+  // This means the maximum value possible is achieved using '2^|lhs| - 1'
+  // subtracted by 0.
+  // The minimum value is achieved when 'lhs' is 0 and 'rhs' is '2^|rhs| - 1'
+  // yielding a result of -'2^|rhs| - 1'.
+  // The latter case necessitates a sign-extension. The sign-extension requires
+  // us to encode the output values in twos-complement, requiring one extra bit
+  // ontop of max(|lhs|, |rhs|).
+  //
+  // Case 2: Both operands are SEXT:
+  // When both operands are sext their range is limited to be '-2^{b-1}' to
+  // '2^{b-1}-1' where b is their respective bitwidths.
+  // The maximum value is achieved when lhs is '2^{|lhs|-1}-1' and rhs is
+  // -2^{|rhs|-1} yielding a value in the magnitude of '2^{max(|lhs|, |rhs|)}'.
+  // The minimum value is achieved when lhs is '-2^{|lhs|-1}' and rhs is
+  // '2^{|rhs|-1}-1' yielding a value in the magnitude of
+  // '-2^{max(|lhs|, |rhs|)}'.
+  // Like the ZEXT case, the latter necessitates sign-extension and an extra bit
+  // to encode both ranges in twos-complement.
+  if (lhs.extType == rhs.extType)
+    return {ExtType::SEXT, std::max(lhs.bitWidth, rhs.bitWidth) + 1};
 
-  // We apply the logic from 'add' here, but with the assumption that 'rhs' is
-  // SEXT.
-  return addWidth({lhs.extType, lhs.bitWidth}, {ExtType::SEXT, rhs.bitWidth});
+  // Otherwise, conservative add logic applies.
+  return addWidth(lhs, rhs);
 }
 
 /// Transfer function for mul operations or alike.
