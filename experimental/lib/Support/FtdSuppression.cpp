@@ -341,7 +341,6 @@ CyclicGraphManager::extractLayeredCFG(const LoopScope *scope,
 
       // The remaining optimizations only apply to level > 0.
       if (scope->level == 0)
-      // if (true)
         continue;
 
       // Merge duplicate successors: CondBranch(A, A) becomes Branch(A).
@@ -856,7 +855,7 @@ generateReachabilityLogic(mlir::OpBuilder &builder, Block *block,
   BoolExpression *fSuppress = fValid->boolNegate();
   fSuppress = fSuppress->boolMinimize();
 
-  // 4. Build BDD and Circuit for Suppression Condition
+  // 3. Build BDD and Circuit for Suppression Condition
   std::set<std::string> vars = fSuppress->getVariables();
   std::vector<std::string> cofactorList(vars.begin(), vars.end());
 
@@ -1470,7 +1469,7 @@ std::unique_ptr<LocalCFG> ftd::buildDecisionGraph(
   if (!rawGraph.newCons)
     return nullptr;
 
-  // NodeSet: Consumer + Sink + Dependencies
+  // 1. NodeSet: Consumer + Sink + Dependencies
   DenseSet<Block *> nodeSet;
   nodeSet.insert(rawGraph.newCons);
   nodeSet.insert(rawGraph.sinkBB);
