@@ -1,5 +1,6 @@
 from generators.support.utils import *
 
+
 def generate_counter_buffer(name, params):
     bitwidth = params["bitwidth"]
     dv_latency = int(params["dv_latency"])
@@ -13,8 +14,10 @@ def generate_counter_buffer(name, params):
     else:
         return _generate_counter_buffer(name, dv_latency, data_type)
 
+
 def _counter_width(dv_latency):
     return 1 if dv_latency <= 1 else (dv_latency - 1).bit_length()
+
 
 def _delay_counter_assignment(dv_latency):
 
@@ -23,13 +26,14 @@ def _delay_counter_assignment(dv_latency):
     if (dv_latency == 1):
         return ""
 
-    ret = "  init(delayCnt) := {dv_latency - 1};"
+    ret = f"  init(delayCnt) := {dv_latency - 1};\n"
     ret += "  next(delayCnt) := case\n"
     ret += f"  !occupied & ins_valid : {dv_latency - 1};\n"
     for i in range(dv_latency):
         if i > 0:
             ret += f"  occupied & delayCnt = {i} : {i-1};\n"
     ret += f"  occupied & delayCnt = 0 : (outs_ready & ins_valid ? {dv_latency - 1} : delayCnt);\n"
+    ret += "  TRUE : delayCnt;\n"
     ret += "esac;"
     return ret
 
@@ -41,7 +45,7 @@ def _generate_counter_buffer_dataless(name, dv_latency):
 MODULE {name} (ins_valid, outs_ready)
   VAR
   occupied     : boolean;
-  delayCnt     : {dv_latency - 1}..0;
+  delayCnt     : 0..{dv_latency - 1};
 
   ASSIGN
   init(occupied) := FALSE;
@@ -67,7 +71,7 @@ def _generate_counter_buffer(name, dv_latency, data_type):
 MODULE {name} (ins, ins_valid, outs_ready)
   VAR
   occupied     : boolean;
-  delayCnt     : {dv_latency - 1}..0;
+  delayCnt     : 0..{dv_latency - 1};
   data : {data_type};
 
   ASSIGN
@@ -95,5 +99,3 @@ MODULE {name} (ins, ins_valid, outs_ready)
   esac;
 
 """
-
-
