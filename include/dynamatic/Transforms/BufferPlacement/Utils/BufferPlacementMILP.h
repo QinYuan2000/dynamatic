@@ -22,8 +22,9 @@
 #include "dynamatic/Support/LLVM.h"
 #include "dynamatic/Support/MILP.h"
 #include "dynamatic/Support/TimingModels.h"
-#include "dynamatic/Transforms/BufferPlacement/BufferingSupport.h"
-#include "dynamatic/Transforms/BufferPlacement/CFDFC.h"
+#include "dynamatic/Transforms/BufferPlacement/Utils/BufferingSupport.h"
+#include "dynamatic/Transforms/BufferPlacement/Utils/CFDFC.h"
+#include "dynamatic/Transforms/BufferPlacement/Utils/UnitMILPVars.h"
 #include "experimental/Support/BlifReader.h"
 #include "experimental/Support/CutlessMapping.h"
 #include "experimental/Support/SubjectGraph.h"
@@ -34,6 +35,8 @@
 #include "llvm/ADT/MapVector.h"
 #include "llvm/ADT/SetVector.h"
 #include "llvm/ADT/SmallVector.h"
+#include <functional>
+#include <optional>
 
 namespace dynamatic {
 struct SimpleCycle;
@@ -52,18 +55,6 @@ struct TimeVars {
   CPVar tIn;
   /// Time at channel's output (i.e., at destination unit's input port).
   CPVar tOut;
-};
-
-/// Holds MILP variables associated to every CFDFC unit. Note that a unit may
-/// appear in multiple CFDFCs and so may have multiple sets of these variables.
-struct UnitVars {
-  /// Fluid retiming of tokens at unit's input (real).
-  CPVar retIn;
-  /// Fluid retiming of tokens at unit's output. Identical to retiming at unit's
-  /// input if the latter is combinational (real).
-  CPVar retOut;
-  /// [FPGA24] Occupancy contribution of this unit (real).
-  CPVar occupancy;
 };
 
 /// Holds MILP variables related to a specific signal (e.g., data, valid, ready)
@@ -107,11 +98,23 @@ struct SynchronizationPatternVars {
 /// the CFDFC, and a CFDFC throughput variable.
 struct CFDFCVars {
   /// Maps each CFDFC unit to its retiming variables.
-  llvm::MapVector<Operation *, UnitVars> unitVars;
+  llvm::DenseMap<Operation *, UnitVars> unitVars;
   /// Channel throughput variables (real).
   llvm::MapVector<Value, CPVar> channelThroughputs;
   /// CFDFC throughput (real).
   CPVar throughput;
+
+  /// Returns the UnitVars for `op`. Hard-aborts (with an op-attached error
+  /// diagnostic so the unit name and location are visible) if the unit is
+  /// not present in the CFDFC.
+  UnitVars &getUnitVarsFor(Operation *op) {
+    auto it = unitVars.find(op);
+    if (it == unitVars.end()) {
+      op->emitError("expected unit present in CFDFC");
+      llvm_unreachable("getUnitVarsFor: unit not present in CFDFC");
+    }
+    return it->second;
+  }
 };
 
 /// Holds all variables that may be used in the MILP. These are a set of
@@ -126,8 +129,6 @@ struct MILPVars {
   SmallVector<SynchronizationPatternVars> reconvergentPathVars;
   /// [FPGA24] Balancing variables for synchronizing cycles.
   SmallVector<SynchronizationPatternVars> syncCycleVars;
-  /// List of units in the function.
-  llvm::MapVector<Operation *, UnitVars> unitVars;
 };
 
 /// Abstract class holding the basic logic for the smart buffer placement pass,
@@ -482,37 +483,7 @@ protected:
   /// Store the buffer placement MILP solution. This makes it possible for a
   /// later pass in the pass pipeline to retrieve the throughput and occupancy
   /// of each CFDFC of the current function.
-  void populateCFDFCThroughputAndOccupancy() {
-    for (auto [idx, cfdfcWithVars] : llvm::enumerate(vars.cfdfcVars)) {
-      auto [cf, cfVars] = cfdfcWithVars;
-
-      cf->throughput = model->getValue(cfVars.throughput);
-      // Store the unit occupancy into the CFDFC data structure.
-      for (auto &[op, var] : cfVars.unitVars) {
-        double occupancy =
-            model->getValue(var.retOut) - model->getValue(var.retIn);
-        // Approximate occupancy to 0 if it is negative but bigger than
-        // -MILP_EPSILON.
-        if (occupancy < 0.0 && occupancy > -MILP_EPSILON) {
-          occupancy = 0.0;
-        }
-        assert(occupancy >= 0.0 && "Unit occupancy must not be non-negative!");
-        cf->unitOccupancy[op] = occupancy;
-      }
-
-      // Store the channel occupancy into the CFDFC data structure.
-      for (auto &[val, var] : cfVars.channelThroughputs) {
-        double occupancy = model->getValue(var);
-        // Approximate occupancy to 0 if it is negative but bigger than
-        // -MILP_EPSILON.
-        if (occupancy < 0.0 && occupancy > -MILP_EPSILON) {
-          occupancy = 0.0;
-        }
-        assert(occupancy >= 0.0 && "Channel occupancy must be non-negative!");
-        cf->channelOccupancy[val] = occupancy;
-      }
-    }
-  }
+  void populateCFDFCThroughputAndOccupancy();
 
 private:
   /// Common logic for all constructors. Fills the channel to buffering
