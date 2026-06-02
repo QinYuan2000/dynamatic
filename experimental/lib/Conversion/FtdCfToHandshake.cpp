@@ -36,6 +36,7 @@
 #include "mlir/Transforms/DialectConversion.h"
 #include "llvm/ADT/SmallVector.h"
 
+#include <functional>
 #include <utility>
 
 // [START Boilerplate code for the MLIR pass]
@@ -484,17 +485,14 @@ static LogicalResult convertConstants(ConversionPatternRewriter &rewriter,
     // This variable will work as activation value for the constant. If the
     // constant is considered as sourcable, this will be the output of a source
     // component, otherwise it remains startValue
-    // auto controlValue = startValue;
-
-    // Determine the new constant's control input
     Value controlValue;
-    // if (isCstSourcable(cstOp)) {
-    //   auto sourceOp = rewriter.create<handshake::SourceOp>(cstOp.getLoc());
-    //   inheritBB(cstOp, sourceOp);
-    //   controlValue = sourceOp.getResult();
-    // } else {
-    controlValue = startValue;
-    // }
+    if (isCstSourcable(cstOp)) {
+      auto sourceOp = rewriter.create<handshake::SourceOp>(cstOp.getLoc());
+      inheritBB(cstOp, sourceOp);
+      controlValue = sourceOp.getResult();
+    } else {
+      controlValue = startValue;
+    }
 
     // Continue the conversion by obtaining the size of the constnat
     TypedAttr valueAttr = cstOp.getValue();
