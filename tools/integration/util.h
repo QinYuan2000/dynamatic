@@ -34,15 +34,17 @@ struct IntegrationTestData {
   // Use model checking to remove redundant logic.
   bool useRigidification = false;
   bool verifyInvariants = false;
+  // Enable speculation, using the speculate pragma
+  bool useSpeculation = false;
   std::string milpSolver = "gurobi";
   std::string bufferAlgorithm = "fpga20";
+  unsigned clockPeriod = 5;
 
   // Results
   int simTime;
 };
 
 int runIntegrationTest(IntegrationTestData &config);
-bool runSpecIntegrationTest(const std::string &name, int &outSimTime);
 int getSimulationTime(const fs::path &logFile);
 
 #endif // UTIL_H
