@@ -23,11 +23,14 @@
 #include "mlir/Dialect/Func/IR/FuncOps.h"
 #include "mlir/Support/LogicalResult.h"
 #include "mlir/Transforms/DialectConversion.h"
+#include "llvm/Support/Debug.h"
 #include <stack>
 
 using namespace mlir;
 using namespace dynamatic;
 using namespace dynamatic::experimental;
+
+#define DEBUG_TYPE "handshake-straight-to-queue"
 
 // [START Boilerplate code for the MLIR pass]
 #include "experimental/Transforms/Passes.h" // IWYU pragma: keep
@@ -302,33 +305,66 @@ static void minimizeGroupsConnections(handshake::FuncOp funcOp,
 
 /// For each element in the group, build a lazy fork and use its output to feed
 /// the correspondent input of the LSQ.
-static DenseMap<Block *, handshake::LazyForkOp>
-connectLSQToForkGraph(handshake::FuncOp &funcOp,
-                      DenseSet<MemoryGroup *> &groups, handshake::LSQOp lsqOp,
-                      PatternRewriter &rewriter) {
-
-  DenseMap<Block *, handshake::LazyForkOp> forksGraph;
-  auto startValue = (Value)funcOp.getArguments().back();
-
-  // Create the fork nodes: for each group among the set of groups
-  for (MemoryGroup *group : groups) {
-    Block *bb = group->bb;
+static handshake::LazyForkOp
+ensureLazyForkOutputCount(Block *bb, Value input, unsigned numResults,
+                          DenseMap<Block *, handshake::LazyForkOp> &forksGraph,
+                          PatternRewriter &rewriter) {
+  auto it = forksGraph.find(bb);
+  if (it == forksGraph.end()) {
     rewriter.setInsertionPointToStart(bb);
-
-    // Add a lazy fork with two outputs, having the start control value as
-    // input and two output ports, one for the LSQ and one for the subsequent
-    // buffer
     auto forkOp = rewriter.create<handshake::LazyForkOp>(bb->front().getLoc(),
-                                                         startValue, 2);
-
-    // Add the new component to the list of components create for FTD and to
-    // the fork graph
+                                                         input, numResults);
     forksGraph[bb] = forkOp;
+    return forkOp;
   }
 
-  // The second output of each lazy fork must be connected to the LSQ, so that
-  // they can activate the allocation for the operations of the corresponding
-  // basic block
+  handshake::LazyForkOp oldFork = it->second;
+  if (oldFork->getNumResults() >= numResults)
+    return oldFork;
+
+  rewriter.setInsertionPoint(oldFork);
+  auto newFork = rewriter.create<handshake::LazyForkOp>(
+      oldFork.getLoc(), oldFork.getOperand(), numResults);
+  newFork->setAttrs(oldFork->getAttrs());
+
+  for (unsigned idx = 0, e = oldFork->getNumResults(); idx < e; ++idx)
+    oldFork->getResult(idx).replaceAllUsesWith(newFork->getResult(idx));
+
+  rewriter.eraseOp(oldFork);
+  forksGraph[bb] = newFork;
+  return newFork;
+}
+
+static void
+connectLSQToForkGraph(handshake::FuncOp &funcOp,
+                      DenseSet<MemoryGroup *> &groups, handshake::LSQOp lsqOp,
+                      DenseMap<Block *, handshake::LazyForkOp> &sharedForks,
+                      DenseMap<Block *, unsigned> &nextAllocPort,
+                      PatternRewriter &rewriter) {
+
+  DenseMap<Block *, unsigned> allocPort;
+  auto startValue = (Value)funcOp.getArguments().back();
+
+  // Create or reuse one fork node per basic block. Result #0 is reserved for
+  // the continuation/dependency network; one extra result is allocated for each
+  // LSQ group allocation control input in the block.
+  for (MemoryGroup *group : groups) {
+    Block *bb = group->bb;
+
+    unsigned port = nextAllocPort.lookup(bb);
+    if (port == 0)
+      port = 1;
+    nextAllocPort[bb] = port + 1;
+    allocPort[bb] = port;
+
+    auto forkOp = ensureLazyForkOutputCount(bb, startValue, port + 1,
+                                            sharedForks, rewriter);
+    sharedForks[bb] = forkOp;
+  }
+
+  // The allocated output of each lazy fork must be connected to the LSQ, so
+  // that it can activate the allocation for the operations of the corresponding
+  // basic block.
   //
   // For each input of the LSQ
   for (auto [opIdx, op] : llvm::enumerate(lsqOp.getOperands())) {
@@ -340,68 +376,11 @@ connectLSQToForkGraph(handshake::FuncOp &funcOp,
     // fork of the graph
     auto cmerge = llvm::dyn_cast<handshake::ControlMergeOp>(op.getDefiningOp());
     Block *bb = cmerge->getBlock();
-    if (!forksGraph.contains(bb))
+    if (!allocPort.contains(bb))
       continue;
-    lsqOp.setOperand(opIdx, forksGraph[bb]->getResult(1));
+    lsqOp.setOperand(opIdx, sharedForks[bb]->getResult(allocPort[bb]));
   }
-
-  return forksGraph;
 }
-
-/// For each element in the group, build an eager fork and use one of its
-/// outputs to feed the corresponding input of the LSQ.
-///
-/// This mirrors the standard flow more closely: `handshake-materialize` can
-/// later promote the fork to a lazy fork if the LSQ control network really
-/// requires it, instead of forcing lazy semantics here for every group.
-// static DenseMap<Block *, Operation *>
-// connectLSQToForkGraph(handshake::FuncOp &funcOp,
-//                       DenseSet<MemoryGroup *> &groups, handshake::LSQOp
-//                       lsqOp, PatternRewriter &rewriter) {
-
-//   DenseMap<Block *, Operation *> forksGraph;
-//   auto startValue = (Value)funcOp.getArguments().back();
-
-//   // Create the fork nodes: for each group among the set of groups
-//   for (MemoryGroup *group : groups) {
-//     Block *bb = group->bb;
-//     rewriter.setInsertionPointToStart(bb);
-
-//     // Add a fork with two outputs, having the start control value as input
-//     and
-//     // two output ports, one for the LSQ and one for the subsequent buffer /
-//     // dependency network.
-//     auto forkOp = rewriter.create<handshake::ForkOp>(bb->front().getLoc(),
-//                                                      startValue, 2);
-
-//     // Add the new component to the list of components create for FTD and to
-//     // the fork graph
-//     forksGraph[bb] = forkOp.getOperation();
-//   }
-
-//   // The second output of each fork must be connected to the LSQ, so that
-//   // they can activate the allocation for the operations of the corresponding
-//   // basic block
-//   //
-//   // For each input of the LSQ
-//   for (auto [opIdx, op] : llvm::enumerate(lsqOp.getOperands())) {
-//     // If it is not a cmerge, then continue
-//     if
-//     (!llvm::isa_and_nonnull<handshake::ControlMergeOp>(op.getDefiningOp()))
-//       continue;
-
-//     // Replace the input if it comes from a cmerge in the same block of a
-//     lazy
-//     // fork of the graph
-//     auto cmerge =
-//     llvm::dyn_cast<handshake::ControlMergeOp>(op.getDefiningOp()); Block *bb
-//     = cmerge->getBlock(); if (!forksGraph.contains(bb))
-//       continue;
-//     lsqOp.setOperand(opIdx, forksGraph[bb]->getResult(1));
-//   }
-
-//   return forksGraph;
-// }
 
 /// Get all the load and store operations related to a LSQ operation
 static SmallVector<handshake::MemPortOpInterface>
@@ -419,55 +398,29 @@ getLsqOps(handshake::FuncOp &funcOp, handshake::LSQOp lsqOp) {
 
 /// Given a graph of lazy forks, connect the elements together with some proper
 /// SSA phi
-// static LogicalResult
-// connectForkGraph(handshake::FuncOp &funcOp,
-//                  const DenseSet<MemoryGroup *> &groupsGraph,
-//                  const DenseMap<Block *, Operation *> &forksGraph,
-//                  PatternRewriter &rewriter) {
-
-//   for (MemoryGroup *consumerGroup : groupsGraph) {
-
-//     DenseMap<OpOperand *, SmallVector<Value>> deps;
-//     SmallVector<Value> forkDeps;
-
-//     for (auto &producerGroup : consumerGroup->preds) {
-//       Operation *producerFork = forksGraph.at(producerGroup->bb);
-//       forkDeps.push_back(producerFork->getResult(0));
-//     }
-
-//     deps[&forksGraph.at(consumerGroup->bb)->getOpOperand(0)] = forkDeps;
-
-//     if (failed(ftd::createPhiNetworkDeps(funcOp.getRegion(), rewriter,
-//     deps)))
-//       return failure();
-//   }
-//   return success();
-// }
-
-/// Given a graph of lazy forks, connect the elements together with some proper
-/// SSA phi
 static LogicalResult
-connectForkGraph(handshake::FuncOp &funcOp,
-                 const DenseSet<MemoryGroup *> &groupsGraph,
-                 const DenseMap<Block *, handshake::LazyForkOp> &forksGraph,
-                 PatternRewriter &rewriter) {
+connectForkGraphs(handshake::FuncOp &funcOp,
+                  ArrayRef<DenseSet<MemoryGroup *>> allGroupsGraphs,
+                  const DenseMap<Block *, handshake::LazyForkOp> &forksGraph,
+                  PatternRewriter &rewriter) {
 
-  for (MemoryGroup *consumerGroup : groupsGraph) {
+  DenseMap<OpOperand *, SmallVector<Value>> deps;
 
-    DenseMap<OpOperand *, SmallVector<Value>> deps;
-    SmallVector<Value> forkDeps;
+  for (const DenseSet<MemoryGroup *> &groupsGraph : allGroupsGraphs) {
+    for (MemoryGroup *consumerGroup : groupsGraph) {
+      handshake::LazyForkOp consumerLF = forksGraph.at(consumerGroup->bb);
+      SmallVector<Value> &forkDeps = deps[&consumerLF->getOpOperand(0)];
 
-    for (auto &producerGroup : consumerGroup->preds) {
-      Operation *producerLF = forksGraph.at(producerGroup->bb);
-      forkDeps.push_back(producerLF->getResult(0));
+      for (auto &producerGroup : consumerGroup->preds) {
+        Operation *producerLF = forksGraph.at(producerGroup->bb);
+        Value producerToken = producerLF->getResult(0);
+        if (!llvm::is_contained(forkDeps, producerToken))
+          forkDeps.push_back(producerToken);
+      }
     }
-
-    deps[&forksGraph.at(consumerGroup->bb)->getOpOperand(0)] = forkDeps;
-
-    if (failed(ftd::createPhiNetworkDeps(funcOp.getRegion(), rewriter, deps)))
-      return failure();
   }
-  return success();
+
+  return ftd::createPhiNetworkDeps(funcOp.getRegion(), rewriter, deps);
 }
 
 /// Remove the network of cmerges in case the function is void. The SQ pass
@@ -746,6 +699,10 @@ static LogicalResult applyStraightToQueue(handshake::FuncOp funcOp,
   if (failed(cfg::restoreCfStructure(funcOp, rewriter)))
     return failure();
 
+  SmallVector<DenseSet<MemoryGroup *>> allGroupsGraphs;
+  DenseMap<Block *, handshake::LazyForkOp> sharedForks;
+  DenseMap<Block *, unsigned> nextAllocPort;
+
   // For each LSQ
   for (const handshake::LSQOp lsqOp : funcOp.getOps<handshake::LSQOp>()) {
 
@@ -755,8 +712,7 @@ static LogicalResult applyStraightToQueue(handshake::FuncOp funcOp,
     // Get all the memory depdencies among the operations connected to the
     // same LSQ
     auto lsqMemDeps = identifyMemoryDependencies(funcOp, lsqOps);
-    for (auto &dep : lsqMemDeps)
-      dep.print();
+    LLVM_DEBUG(for (auto &dep : lsqMemDeps) dep.print());
 
     // Build a group graph out of the dependencies
     auto groupsGraph = constructGroupsGraph(lsqOps, lsqMemDeps);
@@ -764,22 +720,24 @@ static LogicalResult applyStraightToQueue(handshake::FuncOp funcOp,
     // Apply group minimization techniques
     minimizeGroupsConnections(funcOp, groupsGraph);
 
-    for (auto &g : groupsGraph)
-      g->print();
+    LLVM_DEBUG(for (auto &g : groupsGraph) g->print());
 
     // Build a lazy fork for each group and connect it to the related
     // activation input in the LSQ
-    auto forksGraph =
-        connectLSQToForkGraph(funcOp, groupsGraph, lsqOp, rewriter);
+    connectLSQToForkGraph(funcOp, groupsGraph, lsqOp, sharedForks,
+                          nextAllocPort, rewriter);
 
-    // Connect the lazy forks together through a network of merges
-    if (failed(connectForkGraph(funcOp, groupsGraph, forksGraph, rewriter)))
-      return failure();
+    allGroupsGraphs.push_back(std::move(groupsGraph));
+  }
 
-    // Delete the groups
+  // Connect the shared lazy forks together through a network of merges.
+  if (failed(connectForkGraphs(funcOp, allGroupsGraphs, sharedForks, rewriter)))
+    return failure();
+
+  // Delete the groups
+  for (const DenseSet<MemoryGroup *> &groupsGraph : allGroupsGraphs)
     for (auto *g : groupsGraph)
       delete g;
-  }
 
   // Create condition placeholders for every conditional block in the restored
   // CFG. The refactored addGsaGates (called by replaceMergeToGSA) relies on
