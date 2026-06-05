@@ -5,69 +5,147 @@
 
 using namespace dynamatic;
 
-TEST(TypeSystemTests, BinOpParamOnly) {
-  // Bool representing whether a parameter is required.
-  class PlusOfTwoParamOnlyTypeSystem
-      : public gen::TypeSystem</*TypingContext=*/bool,
-                               PlusOfTwoParamOnlyTypeSystem> {
-  public:
-    static std::optional<ConclusionOf<ast::BinaryExpression>>
-    checkBinaryExpression(ast::BinaryExpression::Op op, bool mustBeParameter) {
-      // Saw a binop, parameter is now required.
-      if (!mustBeParameter && op == ast::BinaryExpression::Plus)
-        return ConclusionOf<ast::BinaryExpression>{true, true};
+template <typename TypeSystem>
+class TypeSystemTest : public testing::Test {};
 
-      return std::nullopt;
-    }
+TYPED_TEST_SUITE_P(TypeSystemTest);
 
-    static std::optional<ConclusionOf<ast::Parameter>>
-    checkParameter(const ast::Parameter &, bool mustBeParameter) {
-      if (!mustBeParameter)
-        return std::nullopt;
-
-      return mustBeParameter;
-    }
-
-    static std::optional<ConclusionOf<ast::Variable>>
-    checkVariable(bool mustBeParameter) {
-      if (mustBeParameter)
-        return mustBeParameter;
-      return std::nullopt;
-    }
-
-    static std::optional<ConclusionOf<ast::ScalarType>>
-    checkScalarType(const ast::ScalarType &scalarType, bool) {
-      if (scalarType != ast::PrimitiveType::Double)
-        return std::nullopt;
-
-      return ConclusionOf<ast::ScalarType>{};
-    }
-
-    static std::optional<ConclusionOf<ast::Constant>>
-    checkConstant(const ast::Constant &, bool) {
-      return std::nullopt;
-    }
-
-    static std::optional<ConclusionOf<ast::CastExpression>>
-    checkCastExpression(bool) {
-      return std::nullopt;
-    }
-
-    static std::optional<ConclusionOf<ast::ConditionalExpression>>
-    checkConditionalExpression(bool) {
-      return std::nullopt;
-    }
-  };
-
+TYPED_TEST_P(TypeSystemTest, OutputCheck) {
   Randomly randomly(/*seed=*/42);
-  PlusOfTwoParamOnlyTypeSystem typeSystem;
-  gen::BasicCGenerator generator(randomly, typeSystem, /*entryContext=*/false);
+  TypeParam typeSystem;
+  gen::BasicCGenerator generator(randomly, typeSystem,
+                                 /*entryContext=*/typeSystem.entryContext);
   std::string s;
   llvm::raw_string_ostream os(s);
-  os << generator.generate("test");
+  os << generator.generateFunction("test");
 
-  ASSERT_EQ(s, R"(double test(double var0) {
+  ASSERT_EQ(s, typeSystem.result);
+}
+
+REGISTER_TYPED_TEST_SUITE_P(TypeSystemTest, OutputCheck);
+
+namespace {
+
+enum class PlusOfTwoState {
+  PlusNeeded,
+  FreshParamNeeded,
+  ExistingParamNeeded,
+};
+
+class PlusOfTwoParamOnlyTypeSystem final
+    : public gen::DisallowByDefaultTypeSystem<PlusOfTwoState,
+                                              PlusOfTwoParamOnlyTypeSystem> {
+public:
+  using DisallowByDefaultTypeSystem::DisallowByDefaultTypeSystem;
+
+  static bool discardBinaryExpression(ast::BinaryExpression::Op op,
+                                      PlusOfTwoState state) {
+    return op != ast::BinaryExpression::Plus ||
+           state != PlusOfTwoState::PlusNeeded;
+  }
+
+  gen::TransferFnArray<ast::BinaryExpression>
+  getBinaryExpressionTransferFns(ast::BinaryExpression::Op) override {
+    return {
+        /*lhs=*/TransferFn<ast::BinaryExpression>(
+            PlusOfTwoState::FreshParamNeeded),
+        /*rhs=*/
+        TransferFn<ast::BinaryExpression, ast::BinaryExpression::LHS>(
+            PlusOfTwoState::ExistingParamNeeded),
+        /*output=*/copyInputToOutput<ast::BinaryExpression>(),
+    };
+  }
+
+  static bool discardFreshScalarParameter(PlusOfTwoState state) {
+    return state != PlusOfTwoState::FreshParamNeeded;
+  }
+
+  static bool discardExistingScalarParameter(const ast::ScalarParameter &,
+                                             PlusOfTwoState state) {
+    return false;
+  }
+
+  static bool discardVariable(PlusOfTwoState state) {
+    return state == PlusOfTwoState::PlusNeeded;
+  }
+
+  static bool discardScalarType(const ast::ScalarType &scalarType,
+                                PlusOfTwoState) {
+    return scalarType != ast::PrimitiveType::Double;
+  }
+
+  bool discardReturnType(const ast::ReturnType &returnType,
+                         PlusOfTwoState state) {
+    if (llvm::isa<ast::VoidType>(returnType))
+      return true;
+
+    return TypeSystem::discardReturnType(returnType, state);
+  }
+
+  constexpr static std::string_view result =
+      R"(double test(double var0) {
   return (var0 + var0);
 }
-)");
+)";
+
+  constexpr static auto entryContext = PlusOfTwoState::PlusNeeded;
+};
+
+// Bool representing whether an array read expression is required.
+// Otherwise, a 0 constant must be generated.
+class ReturnArrayConstantOnlyTypeSystem final
+    : public gen::DisallowByDefaultTypeSystem<
+          /*createArrayRead=*/bool, ReturnArrayConstantOnlyTypeSystem> {
+public:
+  using DisallowByDefaultTypeSystem::DisallowByDefaultTypeSystem;
+
+  static bool discardArrayReadExpression(bool createArrayRead) {
+    return !createArrayRead;
+  }
+
+  gen::TransferFnArray<ast::ArrayReadExpression>
+  getArrayReadExpressionTransferFns() override {
+    return {
+        /*array parameter=*/TransferFn<ast::ArrayReadExpression>(false),
+        /*index=*/TransferFn<ast::ArrayReadExpression>(false),
+        /*output=*/copyInputToOutput<ast::ArrayReadExpression>(),
+    };
+  }
+
+  static bool discardFreshArrayParameter(bool createArrayRead) { return false; }
+
+  static bool discardScalarType(const ast::ScalarType &scalarType,
+                                bool /*createArrayRead*/) {
+    return scalarType != ast::PrimitiveType::Double;
+  }
+
+  bool discardReturnType(const ast::ReturnType &returnType, bool state) {
+    if (returnType == ast::VoidType{})
+      return true;
+
+    return TypeSystem::discardReturnType(returnType, state);
+  }
+
+  static std::optional<ast::Constant> discardConstant(const ast::Constant &,
+                                                      bool createArrayRead) {
+    if (createArrayRead)
+      return std::nullopt;
+
+    return ast::Constant{0};
+  }
+
+  constexpr static std::string_view result =
+      R"(double test(double var0[8]) {
+  return var0[((uint32_t)((0)) & (7u))];
 }
+)";
+
+  constexpr static auto entryContext = true;
+};
+
+} // namespace
+
+using MyTypes = ::testing::Types<PlusOfTwoParamOnlyTypeSystem,
+                                 ReturnArrayConstantOnlyTypeSystem>;
+#pragma clang diagnostic ignored "-Wvariadic-macro-arguments-omitted"
+INSTANTIATE_TYPED_TEST_SUITE_P(All, TypeSystemTest, MyTypes);

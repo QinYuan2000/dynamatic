@@ -75,29 +75,40 @@ llvm::raw_ostream &ast::operator<<(llvm::raw_ostream &os,
 }
 
 llvm::raw_ostream &ast::operator<<(llvm::raw_ostream &os,
-                                   const PrintTypePrefix &prefix) {
-  llvm::TypeSwitch<ScalarType>(prefix.datatype)
+                                   const ScalarType &scalarType) {
+  llvm::TypeSwitch<ScalarType>(scalarType)
       .Case([&](const PrimitiveType *primitive) { os << *primitive; });
   return os;
 }
 
 llvm::raw_ostream &ast::operator<<(llvm::raw_ostream &os,
-                                   const PrintTypeSuffix &) {
+                                   const StructuredForStatement &forStatement) {
+  os << "for (uint32_t " << forStatement.getIterVariable() << " = "
+     << forStatement.getStart() << "; " << forStatement.getIterVariable()
+     << " < (" << forStatement.getEnd() << "); "
+     << forStatement.getIterVariable() << " += " << forStatement.getStep()
+     << ") {\n";
+  {
+    mlir::raw_indented_ostream ss(os);
+    ss.indent();
+    for (auto &iter : forStatement.getStatements())
+      ss << iter << '\n';
+  }
+  os << '}';
   return os;
 }
 
 llvm::raw_ostream &ast::operator<<(llvm::raw_ostream &os,
-                                   const Parameter &parameter) {
+                                   const ScalarParameter &parameter) {
 
-  return os << PrintTypePrefix{parameter.getDataType()} << " "
-            << parameter.getName() << PrintTypeSuffix{parameter.getDataType()};
+  return os << parameter.getDataType() << " " << parameter.getName();
 }
 
 llvm::raw_ostream &ast::operator<<(llvm::raw_ostream &os,
                                    const Constant &constant) {
   llvm::TypeSwitch<Constant::Variant>(constant.value)
-      .Case([&](const int32_t *value) { os << *value; })
-      .Case([&](const uint32_t *value) { os << *value << 'u'; })
+      .Case([&](const int32_t *value) { os << '(' << *value << ')'; })
+      .Case([&](const uint32_t *value) { os << '(' << *value << 'u' << ')'; })
       .Case([&](const int8_t *value) {
         os << "(int8_t)(" << static_cast<int32_t>(*value) << ")";
       })
@@ -121,7 +132,7 @@ llvm::raw_ostream &ast::operator<<(llvm::raw_ostream &os,
           os << "NAN";
           return;
         }
-        os << *value;
+        os << '(' << *value << ')';
       });
   return os;
 }
@@ -292,8 +303,7 @@ llvm::raw_ostream &ast::operator<<(llvm::raw_ostream &os,
 
 llvm::raw_ostream &ast::operator<<(llvm::raw_ostream &os,
                                    const CastExpression &castExpression) {
-  return os << "(" << PrintTypePrefix{castExpression.getType()}
-            << PrintTypeSuffix{castExpression.getType()} << ")("
+  return os << "(" << castExpression.getType() << ")("
             << castExpression.getExpression() << ")";
 }
 
@@ -307,6 +317,21 @@ ast::ScalarType ast::UnaryExpression::getType() const {
   }
   case BoolNot:
     return PrimitiveType::Int32;
+  }
+  llvm_unreachable("all enum cases handled");
+}
+
+bool ast::UnaryExpression::isLegalOperandType(Op op, const ScalarType &type) {
+  switch (op) {
+  case BitwiseNot: {
+    auto *prim = llvm::dyn_cast<PrimitiveType>(type);
+    if (!prim)
+      return false;
+    return prim->isInteger();
+  }
+  case BoolNot:
+  case Minus:
+    return true;
   }
   llvm_unreachable("all enum cases handled");
 }
@@ -340,20 +365,58 @@ ast::operator<<(llvm::raw_ostream &os,
             << ternaryExpression.getFalseVal() << ")";
 }
 
+llvm::raw_ostream &
+ast::operator<<(llvm::raw_ostream &os,
+                const ArrayReadExpression &arrayReadExpression) {
+  return os << arrayReadExpression.getArrayParameter() << '['
+            << arrayReadExpression.getIndex() << ']';
+}
+
 llvm::raw_ostream &ast::operator<<(llvm::raw_ostream &os,
                                    const ReturnStatement &statement) {
-  return os << "return " << statement.returnValue << ";";
+  return os << "return " << statement.getReturnValue() << ";";
+}
+
+llvm::raw_ostream &
+ast::operator<<(llvm::raw_ostream &os,
+                const ArrayAssignmentStatement &arrayAssignmentStatement) {
+  return os << arrayAssignmentStatement.getArrayParameter() << '['
+            << arrayAssignmentStatement.getIndexingExpression()
+            << "] = " << arrayAssignmentStatement.getValueExpression() << ';';
+}
+
+llvm::raw_ostream &ast::operator<<(llvm::raw_ostream &os,
+                                   const Statement &statement) {
+  return os << *statement.statement;
+}
+
+llvm::raw_ostream &ast::operator<<(llvm::raw_ostream &os,
+                                   const ArrayParameter &parameter) {
+  return os << parameter.getElementType() << ' ' << parameter.getName() << '['
+            << parameter.getDimension() << ']';
+}
+
+llvm::raw_ostream &ast::operator<<(llvm::raw_ostream &os,
+                                   const ReturnType &returnType) {
+  return os << returnType.variant;
 }
 
 llvm::raw_ostream &ast::operator<<(llvm::raw_ostream &os,
                                    const Function &function) {
-  os << PrintTypePrefix{function.returnType} << ' ' << function.name << '(';
-  llvm::interleaveComma(function.parameters, os);
+  os << function.returnType << ' ' << function.name << '(';
+  llvm::interleaveComma(function.scalarParameters, os);
+  if (!function.scalarParameters.empty() && !function.arrayParameters.empty())
+    os << ", ";
+  llvm::interleaveComma(function.arrayParameters, os);
   os << ") {\n";
 
   mlir::raw_indented_ostream indentedOstream(os);
   indentedOstream.indent();
-  indentedOstream << function.returnStatement;
-  os << "\n}\n";
+  for (auto &iter : function.statements)
+    indentedOstream << iter << '\n';
+  if (function.returnStatement)
+    indentedOstream << *function.returnStatement << '\n';
+
+  os << "}\n";
   return os;
 }

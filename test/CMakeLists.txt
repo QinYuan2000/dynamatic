@@ -10,6 +10,11 @@ set(DYNAMATIC_TEST_DEPENDS
   split-file
   dynamatic-opt
   export-rtl
+  hls-fuzzer-check-bitwidth
+  translate-llvm-to-std
+  source-rewriter
+  DynPragmasPlugin
+  clang
   )
 
 add_lit_testsuite(check-dynamatic "Running the Dynamatic regression tests"

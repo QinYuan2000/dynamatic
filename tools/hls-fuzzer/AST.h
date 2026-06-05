@@ -80,6 +80,16 @@ public:
     MAX_VALUE = Double,
   };
 
+  /// Array containing all primitive types.
+  constexpr static auto ALL_PRIMITIVES = [] {
+    std::array<Type, MAX_VALUE + 1> candidates{};
+    std::size_t j = 0;
+    for (std::size_t i = MIN_VALUE; i <= MAX_VALUE; i++)
+      candidates[j++] = static_cast<Type>(i);
+
+    return candidates;
+  }();
+
   PrimitiveType() = default;
 
   /*implicit*/ PrimitiveType(Type type) : type(type) {}
@@ -179,32 +189,19 @@ public:
   /// Returns true if the given type can directly represent signed values.
   bool isSigned() const;
 
+  bool isInteger() const;
+
   template <typename From>
   friend struct llvm::simplify_type;
+
+  using SubElements = std::tuple<>;
 
 private:
   std::shared_ptr<const Variant> datatype;
 };
 
-/// Wrapper class to print only the type prefix of a datatype.
-/// This is the part of a datatype in the syntax that comes prior to any
-/// identifier.
-struct PrintTypePrefix {
-  const ScalarType &datatype;
-};
-
 llvm::raw_ostream &operator<<(llvm::raw_ostream &os,
-                              const PrintTypePrefix &prefix);
-
-/// Wrapper class to print only the type suffix of a datatype.
-/// This is the part of a datatype in the syntax that comes after any
-/// identifier.
-struct PrintTypeSuffix {
-  const ScalarType &datatype;
-};
-
-llvm::raw_ostream &operator<<(llvm::raw_ostream &os,
-                              const PrintTypeSuffix &suffix);
+                              const ScalarType &scalarType);
 
 /// AST-node representing literals in C.
 /// This is a variant between all possible integer and floating point types.
@@ -214,6 +211,10 @@ struct Constant {
       std::variant<std::int8_t, std::uint8_t, std::int16_t, std::uint16_t,
                    std::int32_t, std::uint32_t, float, double>;
   Variant value;
+
+  struct Tag {
+    friend bool operator<(const Tag &, const Tag &) { return false; }
+  };
 
   /// Returns the type of this expression.
   PrimitiveType getType() const {
@@ -241,9 +242,13 @@ struct Constant {
           return PrimitiveType::Double;
         });
   }
+
+  using SubElements = std::tuple<>;
 };
 
 llvm::raw_ostream &operator<<(llvm::raw_ostream &os, const Constant &constant);
+
+class ScalarParameter;
 
 /// AST-node representing a reference to a variable in C.
 struct Variable {
@@ -251,6 +256,13 @@ struct Variable {
   const std::string name;
 
   const ScalarType &getType() const { return datatype; }
+
+  using SubElements = std::tuple<ScalarParameter>;
+  constexpr static std::size_t PARAMETER = 0;
+
+  struct Tag {
+    friend bool operator<(const Tag &, const Tag &) { return false; }
+  };
 };
 
 llvm::raw_ostream &operator<<(llvm::raw_ostream &os, const Variable &variable);
@@ -259,6 +271,7 @@ class BinaryExpression;
 class CastExpression;
 class UnaryExpression;
 class ConditionalExpression;
+class ArrayReadExpression;
 
 /// Super-type of all AST-nodes representing expressions.
 /// Lifetimes of objects are handled internally via reference counting and does
@@ -266,7 +279,7 @@ class ConditionalExpression;
 class Expression {
   using Variant =
       std::variant<Constant, Variable, BinaryExpression, CastExpression,
-                   UnaryExpression, ConditionalExpression>;
+                   UnaryExpression, ConditionalExpression, ArrayReadExpression>;
 
 public:
   Expression() = default;
@@ -274,7 +287,7 @@ public:
   /// Construct an 'Expression' implicitly from any concrete AST-node.
   template <class T,
             std::enable_if_t<std::conjunction_v<
-                std::negation<std::is_same<T, std::decay_t<Expression>>>,
+                std::negation<std::is_same<std::decay_t<T>, Expression>>,
                 std::is_constructible<Variant, T>>> * = nullptr>
   /*implicit*/ Expression(T &&arg)
       : expression(std::make_shared<Variant>(std::forward<T>(arg))) {}
@@ -311,6 +324,7 @@ public:
     NotEqual,
     MAX_VALUE = NotEqual,
   };
+  using Tag = Op;
 
   BinaryExpression(Expression lhs, Op op, Expression rhs)
       : lhs(std::move(lhs)), op(op), rhs(std::move(rhs)) {}
@@ -327,6 +341,11 @@ public:
   /// Returns true if a value of type 'datatype' is allowed to be used as an
   /// operand for 'op'.
   static bool isLegalOperandType(Op op, const ScalarType &datatype);
+
+  using SubElements = std::tuple<Expression, Expression>;
+
+  constexpr static std::size_t LHS = 0;
+  constexpr static std::size_t RHS = 1;
 
 private:
   Expression lhs;
@@ -348,6 +367,15 @@ public:
   /// Returns the type of this expression, i.e., the type being cast to.
   const ScalarType &getType() const { return targetType; }
 
+  using SubElements = std::tuple<ScalarType, Expression>;
+
+  constexpr static std::size_t TARGET_TYPE = 0;
+  constexpr static std::size_t OPERAND = 1;
+
+  struct Tag {
+    friend bool operator<(const Tag &, const Tag &) { return false; }
+  };
+
 private:
   ScalarType targetType;
   Expression expression;
@@ -360,11 +388,13 @@ llvm::raw_ostream &operator<<(llvm::raw_ostream &os,
 class UnaryExpression {
 public:
   enum Op {
-    BitwiseNot,
+    MIN_VALUE,
+    BitwiseNot = MIN_VALUE,
     BoolNot,
     Minus,
     MAX_VALUE = Minus,
   };
+  using Tag = Op;
 
   UnaryExpression(Op op, Expression expression)
       : op(op), expression(std::move(expression)) {}
@@ -374,6 +404,10 @@ public:
   const Expression &getExpression() const { return expression; }
 
   ScalarType getType() const;
+
+  static bool isLegalOperandType(Op op, const ScalarType &type);
+
+  using SubElements = std::tuple<Expression>;
 
 private:
   Op op;
@@ -399,6 +433,15 @@ public:
 
   ScalarType getType() const;
 
+  using SubElements = std::tuple<Expression, Expression, Expression>;
+  constexpr static std::size_t CONDITION = 0;
+  constexpr static std::size_t TRUE_VAL = 1;
+  constexpr static std::size_t FALSE_VAL = 2;
+
+  struct Tag {
+    friend bool operator<(const Tag &, const Tag &) { return false; }
+  };
+
 private:
   Expression condition;
   Expression trueVal;
@@ -408,25 +451,227 @@ private:
 llvm::raw_ostream &operator<<(llvm::raw_ostream &os,
                               const ConditionalExpression &ternaryExpression);
 
+class ArrayParameter;
+
+/// Expression representing reading and indexing into an array.
+/// Only array parameters and one-dimensional arrays are currently supported.
+class ArrayReadExpression {
+public:
+  /// Constructs an array-read expression from an array element type, the name
+  /// of the array parameter and the indexing expression.
+  ArrayReadExpression(ScalarType elementType, std::string arrayParameter,
+                      Expression index)
+      : dataType(std::move(elementType)),
+        arrayParameter(std::move(arrayParameter)), index(std::move(index)) {}
+
+  /// Returns the name of the array parameters.
+  llvm::StringRef getArrayParameter() const { return arrayParameter; }
+
+  /// Returns the indexing expression.
+  const Expression &getIndex() const { return index; }
+
+  /// Returns the result-type of the expression, which is equivalent to the
+  /// element type of the array.
+  const ScalarType &getType() const { return dataType; }
+
+  using SubElements = std::tuple<ArrayParameter, Expression>;
+
+  constexpr static std::size_t ARRAY_PARAMETER = 0;
+  constexpr static std::size_t INDEX = 1;
+
+  struct Tag {
+    friend bool operator<(const Tag &, const Tag &) { return false; }
+  };
+
+private:
+  ScalarType dataType;
+  std::string arrayParameter;
+  Expression index;
+};
+
+llvm::raw_ostream &operator<<(llvm::raw_ostream &os,
+                              const ArrayReadExpression &arrayReadExpression);
+
 /// AST-Node representing a return statement in C.
-struct ReturnStatement {
-  const Expression returnValue;
+class ReturnStatement {
+public:
+  explicit ReturnStatement(Expression returnValue)
+      : returnValue(std::move(returnValue)) {}
+
+  const Expression &getReturnValue() const { return returnValue; }
+
+  using SubElements = std::tuple<Expression>;
+  constexpr static std::size_t RETURN_VALUE = 0;
+
+private:
+  Expression returnValue;
 };
 
 llvm::raw_ostream &operator<<(llvm::raw_ostream &os,
                               const ReturnStatement &statement);
 
-/// AST-Node representing a function parameter in C.
-class Parameter {
+/// AST-Node representing an assignment to an element of an array.
+/// Note that we model this as a top-level statement despite this being an
+/// expression in C.
+class ArrayAssignmentStatement {
 public:
-  Parameter() = default;
+  ArrayAssignmentStatement(std::string arrayParameter,
+                           Expression indexingExpression,
+                           Expression valueExpression)
+      : arrayParameter(std::move(arrayParameter)),
+        indexingExpression(std::move(indexingExpression)),
+        valueExpression(std::move(valueExpression)) {}
 
-  Parameter(ScalarType dataType, std::string name)
+  llvm::StringRef getArrayParameter() const { return arrayParameter; }
+
+  const Expression &getIndexingExpression() const { return indexingExpression; }
+
+  /// Returns the value that will be assigned to the element.
+  const Expression &getValueExpression() const { return valueExpression; }
+
+  struct Tag {
+    friend bool operator<(const Tag &, const Tag &) { return false; }
+  };
+
+  using SubElements = std::tuple<ArrayParameter, Expression, Expression>;
+  constexpr static std::size_t ARRAY = 0;
+  constexpr static std::size_t INDEX = 1;
+  constexpr static std::size_t VALUE = 2;
+
+private:
+  std::string arrayParameter;
+  Expression indexingExpression;
+  Expression valueExpression;
+};
+
+llvm::raw_ostream &
+operator<<(llvm::raw_ostream &os,
+           const ArrayAssignmentStatement &arrayAssignmentStatement);
+
+class StructuredForStatement;
+
+class Statement {
+  using Variant =
+      std::variant<ArrayAssignmentStatement, StructuredForStatement>;
+
+public:
+  Statement() = default;
+
+  template <class T, std::enable_if_t<std::is_constructible_v<Variant, T> &&
+                                      !std::is_same_v<std::decay_t<Variant>, T>>
+                         * = nullptr>
+  /*implicit*/ Statement(T &&arg)
+      : statement(std::make_shared<Variant>(std::forward<T>(arg))) {}
+
+  friend llvm::raw_ostream &operator<<(llvm::raw_ostream &os,
+                                       const Statement &statement);
+
+private:
+  std::shared_ptr<const Variant> statement;
+};
+
+/// Class representing a list of statements in a body.
+class StatementList {
+public:
+  StatementList() = default;
+
+  explicit StatementList(std::vector<Statement> statements)
+      : statements(std::move(statements)) {}
+
+  /// Returns the number of statements.
+  std::size_t size() const { return statements.size(); }
+
+  const Statement &operator[](std::size_t index) const {
+    return statements[index];
+  }
+
+  auto begin() { return statements.begin(); }
+
+  auto begin() const { return statements.begin(); }
+
+  auto end() { return statements.end(); }
+
+  auto end() const { return statements.end(); }
+
+  std::vector<Statement> takeVector() { return std::move(statements); }
+
+  // Recursive statement list representation.
+  // The definition is left recursive, meaning the statement is always the tail
+  // statement after the list.
+  using SubElements = std::tuple<StatementList, Statement>;
+
+  constexpr static std::size_t STATEMENT_LIST = 0;
+  constexpr static std::size_t STATEMENT = 1;
+
+private:
+  std::vector<Statement> statements;
+};
+
+/// ASTNode representing a structured for statement.
+/// A structured for-statement is a statement with a defined 'start', 'end' and
+/// 'step' value. It defines an iterator of type 'uint32_t' that is
+/// initialized to 'start' and is incremented using 'step' until it is greater
+/// or equal to 'end' (i.e., end value is exclusive).
+class StructuredForStatement {
+public:
+  StructuredForStatement(std::string iterVariable, Expression start,
+                         Expression end, Expression step,
+                         StatementList statements)
+      : iterVariable(std::move(iterVariable)), start(std::move(start)),
+        end(std::move(end)), step(std::move(step)),
+        statements(std::move(statements)) {}
+
+  /// Returns the name of the iterator.
+  llvm::StringRef getIterVariable() const { return iterVariable; }
+
+  /// Returns the start expression.
+  const Expression &getStart() const { return start; }
+
+  /// Returns the end expression.
+  const Expression &getEnd() const { return end; }
+
+  /// Returns the step expression.
+  const Expression &getStep() const { return step; }
+
+  /// Returns the body of the for-statement.
+  const StatementList &getStatements() const { return statements; }
+
+  struct Tag {
+    friend bool operator<(const Tag &, const Tag &) { return false; }
+  };
+
+  using SubElements =
+      std::tuple<Expression, Expression, Expression, StatementList>;
+  constexpr static std::size_t START = 0;
+  constexpr static std::size_t END = 1;
+  constexpr static std::size_t STEP = 2;
+  constexpr static std::size_t BODY = 3;
+
+private:
+  std::string iterVariable;
+  Expression start;
+  Expression end;
+  Expression step;
+  StatementList statements;
+};
+
+llvm::raw_ostream &operator<<(llvm::raw_ostream &os,
+                              const StructuredForStatement &forStatement);
+
+/// AST-Node representing a scalar function parameter in C.
+class ScalarParameter {
+public:
+  ScalarParameter() = default;
+
+  ScalarParameter(ScalarType dataType, std::string name)
       : dataType(std::move(dataType)), name(std::move(name)) {}
 
   llvm::StringRef getName() const { return name; }
 
   const ScalarType &getDataType() const { return dataType; }
+
+  using SubElements = std::tuple<ScalarType>;
+  constexpr static std::size_t DATATYPE = 0;
 
 private:
   ScalarType dataType;
@@ -434,15 +679,132 @@ private:
 };
 
 llvm::raw_ostream &operator<<(llvm::raw_ostream &os,
-                              const Parameter &parameter);
+                              const ScalarParameter &parameter);
+
+/// Variant of 'ScalarParameter' used to represent an existing 'ScalarParameter'
+/// in the generator.
+/// Unlike 'ScalarParameter' it doesn't have any subelements and is a terminal
+/// similar to 'Constant'.
+class ExistingScalarParameter : public ScalarParameter {
+public:
+  /*implicit*/ ExistingScalarParameter(const ScalarParameter &scalarParameter)
+      : ScalarParameter(scalarParameter) {}
+
+  /*implicit*/ ExistingScalarParameter(ScalarParameter &&scalarParameter)
+      : ScalarParameter(std::move(scalarParameter)) {}
+
+  using SubElements = std::tuple<>;
+};
+
+/// AST-Node representing an array function parameter in C.
+class ArrayParameter {
+public:
+  ArrayParameter() = default;
+
+  ArrayParameter(ScalarType elementType, std::string name,
+                 std::size_t dimension)
+      : dataType(std::move(elementType)), name(std::move(name)),
+        dimension(dimension) {
+    assert(dimension > 0);
+  }
+
+  llvm::StringRef getName() const { return name; }
+
+  const ScalarType &getElementType() const { return dataType; }
+
+  std::size_t getDimension() const { return dimension; }
+
+  using SubElements = std::tuple<ScalarType>;
+  constexpr static std::size_t ELEMENT_TYPE = 0;
+
+private:
+  ScalarType dataType;
+  std::string name;
+  std::size_t dimension;
+};
+
+llvm::raw_ostream &operator<<(llvm::raw_ostream &os,
+                              const ArrayParameter &parameter);
+
+/// Variant of 'ArrayParameter' used to represent an existing 'ArrayParameter'
+/// in the generator.
+/// Unlike 'ArrayParameter' it doesn't have any subelements and is a terminal
+/// similar to 'Constant'.
+class ExistingArrayParameter : public ArrayParameter {
+public:
+  /*implicit*/ ExistingArrayParameter(const ArrayParameter &arrayParameter)
+      : ArrayParameter(arrayParameter) {}
+
+  /*implicit*/ ExistingArrayParameter(ArrayParameter &&arrayParameter)
+      : ArrayParameter(std::move(arrayParameter)) {}
+
+  using SubElements = std::tuple<>;
+};
+
+/// Tag type representing the 'void' type from C.
+struct VoidType {
+  friend bool operator==(const VoidType &lhs, const VoidType &rhs) {
+    return true;
+  }
+
+  friend bool operator!=(const VoidType &lhs, const VoidType &rhs) {
+    return !(lhs == rhs);
+  }
+};
+
+inline llvm::raw_ostream &operator<<(llvm::raw_ostream &os, const VoidType &) {
+  return os << "void";
+}
+
+class ReturnType {
+  using Variant = std::variant<VoidType, ScalarType>;
+
+public:
+  ReturnType() = default;
+
+  template <class T, std::enable_if_t<std::is_constructible_v<Variant, T> &&
+                                      !std::is_same_v<std::decay_t<Variant>, T>>
+                         * = nullptr>
+  /*implicit*/ ReturnType(T &&arg) : variant(std::forward<T>(arg)) {}
+
+  friend bool operator==(const ReturnType &lhs, const ReturnType &rhs) {
+    return lhs.variant == rhs.variant;
+  }
+
+  friend bool operator!=(const ReturnType &lhs, const ReturnType &rhs) {
+    return !(lhs == rhs);
+  }
+
+  template <typename From>
+  friend struct llvm::simplify_type;
+
+  friend llvm::raw_ostream &operator<<(llvm::raw_ostream &os,
+                                       const ReturnType &returnType);
+
+  using SubElements = std::tuple<>;
+
+private:
+  Variant variant;
+};
 
 /// AST-Node representing a function in C.
 /// Functions are currently limited to just a return statement.
 struct Function {
-  const ScalarType returnType;
+  /// Void or a return type.
+  const ReturnType returnType;
   const std::string name;
-  const std::vector<Parameter> parameters;
-  const ReturnStatement returnStatement;
+  const std::vector<ScalarParameter> scalarParameters;
+  const std::vector<ArrayParameter> arrayParameters;
+
+  const std::vector<Statement> statements;
+  /// The return statement at the end of a function iff it does not have a void
+  /// return type.
+  const std::optional<ReturnStatement> returnStatement;
+
+  using SubElements = std::tuple<ReturnType, StatementList, ReturnStatement>;
+  constexpr static std::size_t RETURN_TYPE = 0;
+  constexpr static std::size_t STATEMENTS = 1;
+  constexpr static std::size_t RETURN_STATEMENT = 2;
 };
 
 llvm::raw_ostream &operator<<(llvm::raw_ostream &os, const Function &function);
@@ -466,6 +828,11 @@ inline std::size_t ScalarType::getBitwidth() const {
 
 inline bool ScalarType::isSigned() const {
   return std::visit([&](auto &&value) -> bool { return value.isSigned(); },
+                    *datatype);
+}
+
+inline bool ScalarType::isInteger() const {
+  return std::visit([&](auto &&value) -> bool { return value.isInteger(); },
                     *datatype);
 }
 
@@ -495,6 +862,7 @@ auto enumRange() {
 
 // Enable 'dyn_cast' and friends on 'ScalarType' by delegating to 'dyn_cast' on
 // the variant.
+// E.g. 'ast::PrimitiveType* prim = dyn_cast<ast::PrimitiveType>(scalarType);'
 template <>
 struct llvm::simplify_type<dynamatic::ast::ScalarType> {
   using SimpleType = const dynamatic::ast::ScalarType::Variant;
@@ -502,6 +870,16 @@ struct llvm::simplify_type<dynamatic::ast::ScalarType> {
   static SimpleType &
   getSimplifiedValue(const dynamatic::ast::ScalarType &datatype) {
     return *datatype.datatype;
+  }
+};
+
+template <>
+struct llvm::simplify_type<dynamatic::ast::ReturnType> {
+  using SimpleType = const dynamatic::ast::ReturnType::Variant;
+
+  static SimpleType &
+  getSimplifiedValue(const dynamatic::ast::ReturnType &datatype) {
+    return datatype.variant;
   }
 };
 

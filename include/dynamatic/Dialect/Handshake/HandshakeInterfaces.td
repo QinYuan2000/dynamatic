@@ -68,7 +68,7 @@ def BufferLikeOpInterface : OpInterface<"BufferLikeOpInterface"> {
   }];
   let methods = [
    InterfaceMethod<[{
-       Get the internal state of each slot.
+       Get the internal state namer of each slot.
      }],
      "std::vector<BufferSlotFullNamer>", "getInternalSlotStateNamers", (ins)
    >,
@@ -114,6 +114,32 @@ def ShiftLikeArithOpInterface : OpInterface<"ShiftLikeArithOpInterface"> {
      }],
      "bool", "isShiftByConstant", (ins)
    >,
+  ];
+}
+
+def RetimingPathsOpInterface : OpInterface<"RetimingPathsOpInterface"> {
+  let cppNamespace = "::dynamatic::handshake";
+  let description = [{
+    For ops with multiple independent paths through them. 
+    
+    If tokens can pass through a unit from a set of operands to a set
+    of results without affecting a separate set of operands and results,
+    then there is multiple paths through the unit.
+    
+    The MILP buffering algorithms require a unique retiming algorithm
+    per path through a unit to correctly distribute token occupancy 
+    among the circuits channels to achieve maximum performance. 
+
+    Eachh operand and result of the op must belong to exactly
+    one path.
+  }];
+  let methods = [
+    InterfaceMethod<[{
+      Returns the list of independent retiming paths of this op.
+    }],
+    "llvm::SmallVector<::dynamatic::buffer::RetimingPath>",
+    "getRetimingPaths", (ins)
+    >,
   ];
 }
 
@@ -306,6 +332,27 @@ def LatencyInterface : OpInterface<"LatencyInterface"> {
   }]>,
 
   InterfaceMethod<[{
+    Gets the pipeline slots based on the II and the latency.
+    TODO: Actually retrieve the II, instead of just assuming II=1
+
+    Implementation is done here instead of in HandshakeOps.cpp as
+    the code will look the same for any operation.
+  }], "std::vector<PipelineSlotNamer>", "getPipelineSlots", (ins), [{
+    Operation *op = $_op.getOperation();
+    auto attr = op->getAttrOfType<IntegerAttr>("latency");
+    assert(attr && "cannot latency slot without defined latency");
+    auto name = op->getAttrOfType<::mlir::StringAttr>(NameAnalysis::ATTR_NAME);
+    assert(name && "cannot latency slot without defined op name");
+    int64_t latency = attr.getInt();
+    int64_t II = 1;
+    int64_t numSlots = latency / II;
+    std::vector<PipelineSlotNamer> ret(numSlots);
+    for (int64_t i = 0; i < numSlots; ++i) {
+      ret[i] = PipelineSlotNamer(name.str(), i);
+    }
+    return ret;
+  }]>,
+  InterfaceMethod<[{
   Sets the operation latency.
     }], "void", "setLatency", (ins "int64_t":$latency), [{
       $_op->setAttr("latency", IntegerAttr::get(IntegerType::get($_op->getContext(), 64), latency));
@@ -385,6 +432,27 @@ def BLIFImplInterface : OpInterface<"BLIFImplInterface"> {
       }
       return StringAttr::get(op->getContext(), "");
     }]>
+  ];
+}
+
+def RTLAttrInterface : OpInterface<"RTLAttrInterface"> {
+  let cppNamespace = "::dynamatic::handshake";
+  let description = [{
+     Allow specification of generic values to be used in the RTL generation of a
+     Handshake operation. Implementations return the complete set of RTL
+     parameters (generic values) as a list of named attributes, where each entry
+     maps a parameter name to its value. These are passed to the component
+     generator specified in the rtl-config file.
+  }];
+
+  let methods = [
+    InterfaceMethod<[{
+      Returns the RTL parameters for this operation as a list of named
+      attributes. Each entry maps a parameter name to its corresponding
+      attribute value. Returns failure if parameters cannot be determined
+      (e.g., unsupported constant bitwidth).
+    }], "::mlir::FailureOr<::llvm::SmallVector<::mlir::NamedAttribute>>",
+    "getRTLParameters", (ins)>
   ];
 }
 
