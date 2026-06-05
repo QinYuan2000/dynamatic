@@ -560,14 +560,14 @@ void ftd::addRegenOperandConsumer(mlir::OpBuilder &builder,
     // Create the false constant to feed `init`
     auto constOp = builder.create<handshake::ConstantOp>(consumerOp->getLoc(),
                                                           cstAttr, startValue);
-    constOp->setAttr(FTD_INIT_MERGE, rewriter.getUnitAttr());
+    constOp->setAttr(FTD_INIT_MERGE, builder.getUnitAttr());
     constOp->setAttr("handshake.bb", headerBBAttr);
 
     Operation *initOp;
-    initOp = rewriter.create<handshake::InitOp>(consumerOp->getLoc(),
+    initOp = builder.create<handshake::InitOp>(consumerOp->getLoc(),
                                                 conditionValue);
 
-    initOp->setAttr(FTD_INIT_MERGE, rewriter.getUnitAttr());
+    initOp->setAttr(FTD_INIT_MERGE, builder.getUnitAttr());
     initOp->setAttr("handshake.bb", headerBBAttr);
 
     // The multiplexer is to be fed by the init block, and takes as inputs the
