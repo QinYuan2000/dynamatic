@@ -127,10 +127,10 @@ public:
   /// Get the index of a block.
   std::optional<unsigned> getIndexFromBlock(Block *bb) const;
 
-  /// Return true if the index of bb1 is greater than then index of bb2.
+  /// Return true if the index of bb1 is greater than the index of bb2.
   bool isGreater(Block *bb1, Block *bb2) const;
 
-  /// Return true if the index of bb1 is smaller than then index of bb2.
+  /// Return true if the index of bb1 is smaller than the index of bb2.
   bool isLess(Block *bb1, Block *bb2) const;
 
   /// Given a block whose name is `^BBN` (where N is an integer) return a string
@@ -202,6 +202,9 @@ void setBBAttr(Operation *op, IntegerAttr bbAttr);
 /// otherwise computing from `block`.
 void setBBAttrWithFallback(Operation *op, IntegerAttr bbAttr,
                            Block *block, OpBuilder &builder);
+
+/// Build a `handshake.bb` IntegerAttr (32-bit unsigned) for `bbIdx`.
+IntegerAttr getBBIndexAttr(MLIRContext *ctx, unsigned bbIdx);
 
 /// Get or create a SourceOp placeholder in `condBlock` representing the
 /// condition of that block's terminator. Reuses existing placeholder if one

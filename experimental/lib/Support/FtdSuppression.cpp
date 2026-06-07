@@ -26,7 +26,6 @@
 #include "mlir/Dialect/MemRef/IR/MemRef.h"
 #include "mlir/IR/BuiltinOps.h"
 #include "mlir/Transforms/DialectConversion.h"
-#include "llvm/Support/FileSystem.h"
 using namespace mlir;
 using namespace dynamatic;
 using namespace dynamatic::experimental;
@@ -511,9 +510,7 @@ static IntegerAttr getFirstLoopExitBBAttrIfHeaderConsumer(
   });
 
   unsigned exitBBIdx = shadow.getBlockIndex(exitBlocks.front());
-  return IntegerAttr::get(
-      IntegerType::get(builder.getContext(), 32, IntegerType::Unsigned),
-      exitBBIdx);
+  return ftd::getBBIndexAttr(builder.getContext(), exitBBIdx);
 }
 
 /// Helper function to generate expression combining Local Logic (True/False)
@@ -745,7 +742,6 @@ static Value boolExpressionToCircuit(
 
   // Case 2: Constant
   auto sourceOp = builder.create<handshake::SourceOp>(block->front().getLoc());
-  setBBAttr(sourceOp, block, builder);
   auto intType = builder.getIntegerType(1);
   int constVal = (expr->type == ExpressionType::One ? 1 : 0);
   auto cstAttr = builder.getIntegerAttr(intType, constVal);
@@ -919,8 +915,6 @@ buildBranchTreeRecursive(mlir::OpBuilder &builder, StringRef currentVar,
     // Divergence found.
     if (groups.size() > 1) {
       splitFound = true;
-      llvm::errs() << "[FTD] Split Variable Found: " << splitVar
-                   << " at Depth: " << scanDepth << "\n";
       break;
     }
   }
@@ -1876,9 +1870,8 @@ void ftd::insertDirectSuppression(
   unsigned consBBIdx = 0;
   if (auto attr = consumer->getAttrOfType<IntegerAttr>("handshake.bb"))
     consBBIdx = attr.getUInt();
-  IntegerAttr prodBBAttr = IntegerAttr::get(
-      IntegerType::get(builder.getContext(), 32, IntegerType::Unsigned),
-      prodBBIdx);
+  IntegerAttr prodBBAttr =
+      ftd::getBBIndexAttr(builder.getContext(), prodBBIdx);
   IntegerAttr targetBBAttr = prodBBAttr;
   Block *producerIRBlock =
       connection.getDefiningOp() ? connection.getDefiningOp()->getBlock()
@@ -1892,98 +1885,12 @@ void ftd::insertDirectSuppression(
     targetBBAttr = loopExitBBAttr;
   Block *dominatorBlock = producerBlock;
 
-  // --- Optional per-function log file (set FTD_LOG_DIR env var to enable) ---
-  std::unique_ptr<llvm::raw_fd_ostream> logOwner;
-  llvm::raw_ostream *log = nullptr;
-  if (const char *logDir = std::getenv("FTD_LOG_DIR")) {
-    std::string path =
-        std::string(logDir) + "/" + funcOp.getName().str() + "_ftd.log";
-    std::error_code ec;
-    logOwner = std::make_unique<llvm::raw_fd_ostream>(
-        path, ec, llvm::sys::fs::OF_Append);
-    if (!ec)
-      log = logOwner.get();
-  }
-
-  auto blockName = [](const ftd::LocalCFG &cfg, Block *b) -> std::string {
-    if (!b)
-      return "(null)";
-    if (b == cfg.sinkBB)
-      return "sink";
-    if (b == cfg.secondVisitBB)
-      return "secondVisit";
-    auto it = cfg.origMap.find(b);
-    if (it != cfg.origMap.end() && it->second) {
-      std::string name;
-      llvm::raw_string_ostream ss(name);
-      it->second->printAsOperand(ss);
-      return ss.str();
-    }
-    std::string name;
-    llvm::raw_string_ostream ss(name);
-    b->printAsOperand(ss);
-    return "local(" + ss.str() + ")";
-  };
-
-  auto dumpLocalCFG = [&](const ftd::LocalCFG &cfg, llvm::StringRef name) {
-    if (!log)
-      return;
-    *log << "===== " << name << " =====\n";
-    *log << "  prod=" << blockName(cfg, cfg.newProd)
-         << "  cons=" << blockName(cfg, cfg.newCons)
-         << "  sink=" << blockName(cfg, cfg.sinkBB);
-    if (cfg.secondVisitBB)
-      *log << "  secondVisit=" << blockName(cfg, cfg.secondVisitBB);
-    *log << "\n  topo: ";
-    for (unsigned i = 0; i < cfg.topoOrder.size(); ++i) {
-      if (i > 0)
-        *log << " -> ";
-      *log << blockName(cfg, cfg.topoOrder[i]);
-    }
-    *log << "\n  edges:\n";
-    if (cfg.region) {
-      for (Block *b : cfg.topoOrder) {
-        Operation *term = b->getTerminator();
-        if (!term || term->getNumSuccessors() == 0)
-          continue;
-        std::string src = blockName(cfg, b);
-        if (auto condBr = dyn_cast<cf::CondBranchOp>(term)) {
-          *log << "    " << src
-               << " -T-> " << blockName(cfg, condBr.getTrueDest())
-               << ", -F-> " << blockName(cfg, condBr.getFalseDest()) << "\n";
-        } else {
-          for (unsigned i = 0; i < term->getNumSuccessors(); ++i) {
-            *log << "    " << src
-                 << " -> " << blockName(cfg, term->getSuccessor(i)) << "\n";
-          }
-        }
-      }
-    }
-    *log << "\n";
-  };
-
   // Account for the condition of a Mux only if it corresponds to a GAMMA GSA
   // gate and the producer is one of its data inputs
   bool deliverToGamma = llvm::isa<handshake::MuxOp>(consumer) &&
                         consumer->hasAttr(FTD_EXPLICIT_GAMMA) &&
                         (producerBlock != consumerBlock ||
                          connection.getDefiningOp()->hasAttr(FTD_EXPLICIT_MU));
-
-  if (log) {
-    *log << "[FTD] Producer block: ";
-    if (producerBlock)
-      producerBlock->printAsOperand(*log);
-    else
-      *log << "(null)";
-    *log << ", Consumer block: ";
-    if (consumerBlock)
-      consumerBlock->printAsOperand(*log);
-    else
-      *log << "(null)";
-    *log << "\n";
-  }
-
-  // Activate graph dumps when deliverToGamma is true (user-adjustable)
 
 
   // If producer is unreachable, the suppression is not needed.
@@ -2067,19 +1974,7 @@ void ftd::insertDirectSuppression(
       currentConnection = currentMuxOp->getResult(0);
       currentMuxOp = nextMuxOp;
     }
-    if (lastValidDominator && lastValidDominator != producerBlock) {
-      llvm::errs() << "[FTD] Last valid dominator block in Mux chain: ";
-      lastValidDominator->printAsOperand(llvm::errs());
-      llvm::errs() << "\n";
-    }
     dominatorBlock = lastValidDominator;
-  }
-
-  if (log && deliverToGamma) {
-    *log << "[FTD] Dominator block: ";
-    if (dominatorBlock)
-      dominatorBlock->printAsOperand(*log);
-    *log << "\n";
   }
 
   // Create a temporary builder to isolate the LocalCFG creation from the
@@ -2088,8 +1983,6 @@ void ftd::insertDirectSuppression(
   OpBuilder tmpBuilder(funcOp.getContext());
   auto locGraph =
       buildLocalCFGRegion(tmpBuilder, dominatorBlock, consumerBlock, bi);
-
-  dumpLocalCFG(*locGraph, "locGraph (Dominator -> Consumer)");
 
 
   ControlDependenceAnalysis locCDA(*locGraph->region);
@@ -2208,11 +2101,9 @@ void ftd::insertDirectSuppression(
       }
 
       if (nextMuxOp) {
-        if (log) *log << "    -> Found Cascaded Gamma Mux\n";
         currentMuxOp = nextMuxOp;
       } else {
         isChainActive = false;
-        if (log) *log << "    -> End of Gamma Mux Chain.\n";
       }
     }
   }
@@ -2259,8 +2150,6 @@ void ftd::insertDirectSuppression(
   auto fullDecisionGraph =
       buildDecisionGraph(*locGraph, locConsControlDepsFull);
 
-  dumpLocalCFG(*fullDecisionGraph, "fullDecisionGraph (locGraph + FullDeps)");
-
   // Cycle Analysis Integration
   ftd::CyclicGraphManager cyclicMgr(*fullDecisionGraph);
 
@@ -2281,8 +2170,6 @@ void ftd::insertDirectSuppression(
   OpBuilder level0Builder(funcOp.getContext());
   auto level0CFG = cyclicMgr.extractLayeredCFG(
       cyclicMgr.getTopLevelScope(), level0Builder);
-
-  dumpLocalCFG(*level0CFG, "level0CFG (Acyclic Layered from fullDG)");
 
   // CDA on the acyclic level 0 CFG — allControlDeps == forwardControlDeps
   // because the graph is a DAG.
@@ -2321,8 +2208,6 @@ void ftd::insertDirectSuppression(
   // Level 0: distribution graph (unconstrained, covers all paths)
   auto level0FullDG = buildDecisionGraph(*level0CFG, level0Deps);
 
-  dumpLocalCFG(*level0FullDG, "level0FullDG (level0CFG + Deps)");
-
   // Pre-register demoted values for high-level variables in level 0
   demotionHelper.preRegisterDemotedValues(level0FullDG, registry);
 
@@ -2333,20 +2218,6 @@ void ftd::insertDirectSuppression(
   auto level0ConstrainedDG =
       buildDecisionGraph(*level0CFG, level0Deps, level0MuxConstraints);
 
-  dumpLocalCFG(*level0ConstrainedDG,
-               "level0ConstrainedDG (level0CFG + muxConstraints)");
-
-  if (log && !muxConstraints.empty()) {
-    *log << "  muxConstraints (" << muxConstraints.size() << "):\n";
-    for (auto &entry : muxConstraints) {
-      *log << "    ";
-      if (entry.first)
-        entry.first->printAsOperand(*log);
-      *log << " requires " << (entry.second ? "TRUE" : "FALSE") << "\n";
-    }
-    *log << "\n";
-  }
-
   ControlDependenceAnalysis decCDA(*level0ConstrainedDG->region);
   DenseSet<Block *> constrainedDeps =
       decCDA.getAllBlockDeps()[level0ConstrainedDG->newCons].allControlDeps;
@@ -2355,11 +2226,9 @@ void ftd::insertDirectSuppression(
       enumeratePaths(*level0ConstrainedDG, bi, constrainedDeps);
 
   fCons = fCons->boolMinimize();
-  if (log) *log << "fCons  = " << fCons->toString() << "\n";
   // f_supp = f_prod and not f_cons
   BoolExpression *fSup = fCons->boolNegate();
   fSup = fSup->boolMinimize();
-  if (log) *log << "fSupmin  = " << fSup->toString() << "\n\n";
 
   // Suppression Logic between Dominator and Producer (locGraphDP)
   BoolExpression *fSupDP = BoolExpression::boolZero();
@@ -2370,8 +2239,6 @@ void ftd::insertDirectSuppression(
     auto locGraphDP = buildLocalCFGRegion(tmpBuilder2, dominatorBlock,
                                           producerBlock, bi);
 
-    dumpLocalCFG(*locGraphDP, "locGraphDP (Dominator -> Producer)");
-
     if (locGraphDP->newCons) {
       // Build fullDecisionGraph for DP path
       ControlDependenceAnalysis dpLocCDA(*locGraphDP->region);
@@ -2379,14 +2246,12 @@ void ftd::insertDirectSuppression(
           dpLocCDA.getAllBlockDeps()[locGraphDP->newCons].allControlDeps;
       auto dpFullDG = buildDecisionGraph(*locGraphDP, dpDepsTmp);
 
-      dumpLocalCFG(*dpFullDG, "dpFullDG (locGraphDP + dpDeps)");
       ControlDependenceAnalysis finalDpCDA(*dpFullDG->region);
       DenseSet<Block *> dpDeps =
           finalDpCDA.getAllBlockDeps()[dpFullDG->newCons].allControlDeps;
 
       BoolExpression *fConsDP = enumeratePaths(*dpFullDG, bi, dpDeps);
       fSupDP = fConsDP->boolMinimize()->boolNegate()->boolMinimize();
-      if (log) *log << "fSupDP   = " << fSupDP->toString() << "\n\n";
 
       // Pre-compute DP rank before erasing
       rankDP = computeTopoRank(*dpFullDG);

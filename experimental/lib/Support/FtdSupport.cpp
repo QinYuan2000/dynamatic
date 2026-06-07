@@ -37,12 +37,12 @@ ftd::BlockIndexing::BlockIndexing(Region &region) {
   for (Block &bb : region.getBlocks())
     allBlocks.push_back(&bb);
 
-  // Sort the vector according to the dominance information, so that a block
-  // comes before each dominators.
+  // Sort the vector according to the dominance information, so that each
+  // block comes after its dominators.
   llvm::sort(allBlocks.begin(), allBlocks.end(),
              [&](Block *a, Block *b) { return domInfo.dominates(a, b); });
 
-  // Associate a smalled index in the map to the blocks at higer levels of the
+  // Associate a smaller index in the map to the blocks at higher levels of the
   // dominance tree
   for (auto [blockID, bb] : llvm::enumerate(allBlocks)) {
     indexToBlock.insert({blockID, bb});
@@ -112,7 +112,7 @@ bool ftd::isSameLoopBlocks(Block *source, Block *dest,
   return isSameLoop(li.getLoopFor(source), li.getLoopFor(dest));
 }
 
-//// Recursively check whether `inner` is the same loop as `outer`, or is
+/// Recursively check whether `inner` is the same loop as `outer`, or is
 /// nested inside `outer` (i.e., any ancestor of `inner` matches `outer`).
 static bool isSameOrInnerLoop(const CFGLoop *inner, const CFGLoop *outer) {
   if (!inner || !outer)
@@ -155,7 +155,7 @@ static void dfsAllPaths(Block *start, Block *end, std::vector<Block *> &path,
     // Else, for each successor which was not visited, run DFS again
     for (Block *successor : start->getSuccessors()) {
 
-      // Do not run DFS if the successor is in the list of blocks to traverse
+      // Do not run DFS into a successor that is in the list of blocks to avoid
       bool incorrectPath = false;
       for (auto *toAvoid : blocksToAvoid) {
         if (toAvoid == successor && bi.isGreater(toAvoid, blockToTraverse)) {
@@ -235,7 +235,7 @@ ftd::getPathExpression(ArrayRef<Block *> path,
         boolean::BoolExpression *pathCondition =
             boolean::BoolExpression::parseSop(blockCondition);
 
-        // Possibly add the condition to the list of cofactors
+        // Add the condition's block index to the list of cofactors
         blockIndexSet.insert(blockIndex);
 
         // Negate the condition if `secondBlock` is reached when the condition
@@ -312,6 +312,11 @@ SmallVector<Type> ftd::getListTypes(Type inputType, unsigned size) {
 // IR attribute utilities
 // ===--------------------------------------------------------------------=== //
 
+IntegerAttr ftd::getBBIndexAttr(MLIRContext *ctx, unsigned bbIdx) {
+  return IntegerAttr::get(
+      IntegerType::get(ctx, 32, IntegerType::Unsigned), bbIdx);
+}
+
 void ftd::setBBAttr(Operation *op, Block *block, OpBuilder &builder) {
   unsigned idx = 0;
   for (Block &blk : *block->getParent()) {
@@ -319,10 +324,7 @@ void ftd::setBBAttr(Operation *op, Block *block, OpBuilder &builder) {
       break;
     idx++;
   }
-  op->setAttr("handshake.bb",
-              IntegerAttr::get(IntegerType::get(builder.getContext(), 32,
-                                                IntegerType::Unsigned),
-                               idx));
+  op->setAttr("handshake.bb", getBBIndexAttr(builder.getContext(), idx));
 }
 
 void ftd::setBBAttr(Operation *op, IntegerAttr bbAttr) {

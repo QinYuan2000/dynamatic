@@ -7,7 +7,7 @@
 //===----------------------------------------------------------------------===//
 //
 // Declares the core functions to run the Fast Token Delivery algorithm,
-// according to the original FPGA'22 paper by Elakhras et al.
+// according to the original FPL'22 paper by Elakhras et al.
 // (https://ieeexplore.ieee.org/document/10035134).
 //
 // This file contains the top-level algorithm orchestration (GSA conversion,
@@ -36,12 +36,12 @@ namespace ftd {
 void createAllCondPlaceholders(Region &region, OpBuilder &builder);
 
 /// After addBranchOps (multi-block, handshake ConditionalBranchOps exist),
-/// replace each SourceOp placeholder with XorOp(realCond, 0) that captures
+/// replace each condition placeholder with NotIOp(realCond) that captures
 /// the actual handshake condition value.
 void resolveCondPlaceholders(handshake::FuncOp funcOp, OpBuilder &builder,
                              ShadowCFG &shadow);
 
-/// After addFtdRegen/addSupp, short-circuit all XorOp condition placeholders
+/// After addRegen/addSupp, short-circuit all NotIOp condition placeholders
 /// and erase them along with their source+constant operands.
 void finalizeCondPlaceholders(handshake::FuncOp funcOp);
 
@@ -60,9 +60,9 @@ void addSuppOperandConsumer(mlir::OpBuilder &builder, handshake::FuncOp &funcOp,
 
 /// When the consumer is in a loop while the producer is not, the value must
 /// be regenerated as many times as needed. This function is in charge of
-/// adding some merges to the network, to that this can be done. The new
+/// adding some merges to the network, so that this can be done. The new
 /// merge is moved inside of the loop, and it works like a reassignment
-/// (cfr. FPGA'22, Section V.C).
+/// (cfr. FPL'22, Section V.C).
 void addRegen(handshake::FuncOp &funcOp, mlir::OpBuilder &builder,
                  ShadowCFG &shadow);
 
@@ -70,7 +70,7 @@ void addRegen(handshake::FuncOp &funcOp, mlir::OpBuilder &builder,
 /// producer might create a token which is never used by the corresponding
 /// consumer, because of the control decisions. In this scenario, the token
 /// must be suppressed. This function inserts a `SUPPRESS` block whenever it
-/// is necessary, according to FPGA'22 (IV.C and V)
+/// is necessary, according to FPL'22 (IV.C and V)
 void addSupp(handshake::FuncOp &funcOp, mlir::OpBuilder &builder,
              ShadowCFG &shadow);
 

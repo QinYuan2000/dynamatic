@@ -132,7 +132,7 @@ getDominanceFrontier(Region &region) {
 
   DenseMap<Block *, DenseSet<Block *>> result;
 
-  // Create an empty set of reach available block
+  // Create an empty dominance-frontier set for each block
   for (Block &bb : region.getBlocks())
     result.insert({&bb, DenseSet<Block *>()});
 
@@ -546,9 +546,7 @@ void ftd::addRegenOperandConsumer(mlir::OpBuilder &builder,
 
     // BB index of the loop header (for handshake.bb tagging)
     unsigned headerBBIdx = shadow.getBlockIndex(loop->getHeader());
-    auto headerBBAttr = IntegerAttr::get(
-        IntegerType::get(builder.getContext(), 32, IntegerType::Unsigned),
-        headerBBIdx);
+    auto headerBBAttr = ftd::getBBIndexAttr(builder.getContext(), headerBBIdx);
 
     // Determine the loop exit condition:
     Value conditionValue;
@@ -614,7 +612,7 @@ void ftd::addSuppOperandConsumer(mlir::OpBuilder &builder,
                                  Operation *consumerOp, Value operand,
                                  ShadowCFG &shadow) {
 
-  // Skip the prod-cons if the producer is part of the operations related to
+  // Skip the prod-cons if the consumer is part of the operations related to
   // the BDD expansion or INIT merges
   if (consumerOp->hasAttr(FTD_OP_TO_SKIP) ||
       consumerOp->hasAttr(FTD_INIT_MERGE))
@@ -653,13 +651,13 @@ void ftd::addSuppOperandConsumer(mlir::OpBuilder &builder,
     if (llvm::isa<handshake::ConditionalBranchOp>(producerOp))
       return;
 
-    // Skip the prod-cons if the consumer is part of the operations
+    // Skip the prod-cons if the producer is part of the operations
     // related to the BDD expansion or INIT merges
     if (producerOp->hasAttr(FTD_OP_TO_SKIP) ||
         producerOp->hasAttr(FTD_INIT_MERGE))
       return;
 
-    // Skip if either the producer of the consumer are
+    // Skip if either the producer or the consumer are
     // related to memory operations, or if the consumer is a conditional
     // branch
     if (llvm::isa_and_nonnull<handshake::MemoryControllerOp>(consumerOp) ||
@@ -877,16 +875,6 @@ LogicalResult experimental::ftd::addGsaGates(
         mlir::DominanceInfo domInfo;
         mlir::CFGLoopInfo loopInfo(domInfo.getDomTree(&region));
 
-        // The inputs of the merge are the condition value and a `false`
-        // constant driven by the start value of the function. This will
-        // created later on, so we use a dummy value.
-        // SmallVector<Value> mergeOperands;
-        // mergeOperands.push_back(conditionValue);
-        // mergeOperands.push_back(conditionValue);
-
-        // auto initMergeOp =
-        //     rewriter.create<handshake::MergeOp>(loc, mergeOperands);
-
         Operation *initOp;
         initOp = rewriter.create<handshake::InitOp>(loc, conditionValue);
 
@@ -896,16 +884,6 @@ LogicalResult experimental::ftd::addGsaGates(
         // Replace the new condition value
         conditionValue = initOp->getResult(0);
         conditionValue.setType(channelifyType(conditionValue.getType()));
-
-        // Add the activation constant driven by the backedge value, which will
-        // be then updated with the real start value, once available
-        // auto cstType = rewriter.getIntegerType(1);
-        // auto cstAttr = IntegerAttr::get(cstType, 0);
-        // rewriter.setInsertionPointToStart(initMergeOp->getBlock());
-        // auto constOp = rewriter.create<handshake::ConstantOp>(
-        //     initMergeOp->getLoc(), cstAttr, startValue);
-        // constOp->setAttr(FTD_INIT_MERGE, rewriter.getUnitAttr());
-        // initMergeOp->setOperand(0, constOp.getResult());
       }
 
       // When a single input gamma is encountered, a mux is inserted as a
@@ -921,7 +899,7 @@ LogicalResult experimental::ftd::addGsaGates(
         loc, ftd::channelifyType(gate->result.getType()),
         conditionValue, operands);
 
-      // The one input gamma is marked at an operation to skip in the IR and
+      // The one input gamma is marked as an operation to skip in the IR and
       // later removed
       if (nullOperand >= 0)
         oneInputGammaList.insert(mux);
