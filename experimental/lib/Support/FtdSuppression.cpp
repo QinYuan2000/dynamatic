@@ -6,10 +6,25 @@
 //
 //===----------------------------------------------------------------------===//
 //
-// Implements the suppression infrastructure for the Fast Token Delivery (FTD)
-// algorithm: local CFG construction, decision graph extraction, cyclic
-// analysis, BDD-to-circuit conversion, token distribution, and the main
-// insertDirectSuppression entry point.
+// This file builds the circuitry that discards ("suppresses") a producer's
+// data token on the executions where its consumer will not use it.
+//
+// Given the producer block and the consumer block, it reconstructs just the
+// part of the control-flow graph that connects them, reduces it to the branch
+// decisions that determine whether the consumer is reached, turns that into a
+// Boolean condition, and emits the hardware (a tree of muxes and branches)
+// that evaluates the condition and drops the token when it should not be
+// delivered.
+//
+// Main pieces, in the order the pipeline uses them:
+//   - reconstruct the relevant control flow      (buildLocalCFGRegion)
+//   - keep only the deciding branches            (buildDecisionGraph)
+//   - analyze loops / produce an acyclic graph   (CyclicGraphManager)
+//   - enumerate paths into a Boolean condition   (enumeratePaths)
+//   - turn a condition into a mux-tree circuit   (bddToCircuit / expressionToCircuit)
+//   - route condition tokens to the muxes        (buildDistributionNetwork)
+//   - move condition tokens across loop levels   (CyclicDemotionHelper)
+//   - drive the whole thing                      (insertDirectSuppression)
 //
 //===----------------------------------------------------------------------===//
 
@@ -1246,9 +1261,18 @@ Value ftd::computeLoopBackedgeCondition(
 // LocalCFG and Decision Graph construction
 // ===--------------------------------------------------------------------=== //
 
-/// Build a local control-flow subgraph (LocalCFG) between a producer and
-/// consumer. The subgraph is reconstructed as a region with unique entry
-/// (producer) and exit (sink).
+/// Reconstructs, as a fresh standalone region, the part of the control-flow
+/// graph a token can travel through on its way from `origProd` to `origCons`.
+///
+/// Every forward path from producer to consumer is kept; every other edge —
+/// paths that miss the consumer, or that return to the producer — is routed to
+/// a single `sink` block. "Reaches the consumer" versus "reaches the sink"
+/// then captures exactly when the token should be delivered versus discarded.
+/// Loops lying on a producer-to-consumer path are kept as real cycles (see the
+/// successor handling below); back edges that leave the region are cut to sink.
+///
+/// In the result, `newProd` is the entry, `newCons` is the block standing for
+/// the consumer, and `sinkBB` is the shared exit.
 std::unique_ptr<LocalCFG>
 ftd::buildLocalCFGRegion(OpBuilder &builder, Block *origProd, Block *origCons,
                     const ftd::BlockIndexing &bi) {
@@ -1309,9 +1333,14 @@ ftd::buildLocalCFGRegion(OpBuilder &builder, Block *origProd, Block *origCons,
       Block *nextBlockInLocalCFG =
           nullptr; // Where the edge points to in the new graph
 
-      // Determine the edge destination based on rules
+      // Decide where this edge goes in the new graph. The order of the checks
+      // matters: the "already cloned" check comes before the back-edge check
+      // on purpose. An edge to a block we have already cloned reuses that
+      // clone, which keeps a loop as a real cycle here (later loop handling
+      // relies on it). Only edges to not-yet-cloned blocks that run backwards
+      // in block order are treated as region-leaving back edges and cut to sink.
 
-      // Case 1: Consumer Reached (Valid Delivery)
+      // Edge reaches the consumer: deliver the token here.
       if (succOrig == origCons) {
         if (succOrig == origProd) {
           // Self-loop delivery
@@ -1341,12 +1370,14 @@ ftd::buildLocalCFGRegion(OpBuilder &builder, Block *origProd, Block *origCons,
           nextBlockInLocalCFG = L->newCons;
         }
       }
-      // Case 2: Producer revisited, consumer not reached (Invalid)
+      // Edge returns to the producer without reaching the consumer: the
+      // current token would be overwritten by the next one, so discard it.
       else if (succOrig == origProd) {
         nextBlockInLocalCFG = L->sinkBB;
       }
-      // Already cloned (discovered) but may not be visited yet.
-      // Reuse the existing clone to avoid duplicating blocks for the same orig.
+      // Edge targets a block we have already cloned: reuse that clone. This is
+      // what keeps an on-path loop as a cycle in the new graph. If the target
+      // has not been explored yet, schedule it (once).
       else if (cloned.count(succOrig)) {
         nextBlockInLocalCFG = cloned[succOrig];
         // If this node hasn't been visited yet, ensure it will be traversed
@@ -1356,17 +1387,16 @@ ftd::buildLocalCFGRegion(OpBuilder &builder, Block *origProd, Block *origCons,
           successorsToVisit.push_back({succOrig, nextBlockInLocalCFG});
         }
       }
-      // Case 3: Visited
+      // Defensive: seen but not cloned (should not happen via this builder).
       else if (visited.count(succOrig)) {
-        // Normally unreachable now because cloned.count(succOrig) should hold
-        // if it was ever visited through this builder. Keep as safety.
         nextBlockInLocalCFG = L->sinkBB;
       }
-      // Case 4: Invalid Back-edge
+      // Back edge that leaves the region (targets an earlier, unexplored
+      // block): the path does not reach the consumer, so cut it to sink.
       else if (bi.isLess(succOrig, currOrig)) {
         nextBlockInLocalCFG = L->sinkBB;
       }
-      // Case 5: Valid Forward Edge (Continue Traversal)
+      // New forward edge: clone the target and keep exploring.
       else {
         Block *newSucc = new Block();
         R.push_back(newSucc);
@@ -1850,6 +1880,41 @@ Value CyclicDemotionHelper::getValueAtLevel(const std::string &varName,
   }
 
 
+/// Computes the suppression condition for a value flowing from
+/// `producerBlock` to `consumerBlock` and returns the basic blocks of the
+/// branch conditions it involves.
+static SmallVector<Block *>
+collectSuppressionConditionBlocks(Block *producerBlock, Block *consumerBlock,
+                                  const ftd::BlockIndexing &bi) {
+  SmallVector<Block *> condBlocks;
+  if (!producerBlock || !consumerBlock || producerBlock == consumerBlock)
+    return condBlocks;
+
+  OpBuilder tmp(producerBlock->getParent()->getContext());
+  auto loc = ftd::buildLocalCFGRegion(tmp, producerBlock, consumerBlock, bi);
+  if (loc->newCons && loc->newCons != loc->sinkBB) {
+    ControlDependenceAnalysis locCDA(*loc->region);
+    DenseSet<Block *> deps =
+        locCDA.getAllBlockDeps()[loc->newCons].allControlDeps;
+    auto dg = ftd::buildDecisionGraph(*loc, deps);
+
+    ControlDependenceAnalysis dgCDA(*dg->region);
+    DenseSet<Block *> dgDeps =
+        dgCDA.getAllBlockDeps()[dg->newCons].allControlDeps;
+
+    BoolExpression *fCons = enumeratePaths(*dg, bi, dgDeps);
+    BoolExpression *fSup = fCons->boolMinimize()->boolNegate()->boolMinimize();
+
+    for (const std::string &var : fSup->getVariables())
+      if (auto blkOpt = bi.getBlockFromCondition(var))
+        condBlocks.push_back(blkOpt.value());
+
+    dg->containerOp->erase();
+  }
+  loc->containerOp->erase();
+  return condBlocks;
+}
+
 // ===--------------------------------------------------------------------=== //
 // insertDirectSuppression — main suppression entry point
 // ===--------------------------------------------------------------------=== //
@@ -1944,9 +2009,9 @@ void ftd::insertDirectSuppression(
                          isReachableAcyclic(condBlock->getSuccessor(0), producerBlock) &&
                          isReachableAcyclic(condBlock->getSuccessor(1), producerBlock);
 
-        // Among all qualifying condBlocks, pick the one earliest in
-        // topological order (smallest by bi). This gives the outermost
-        // dominator that still encloses the producer on both branches.
+        // Of the qualifying condition blocks, keep the one earliest in block
+        // order: it dominates the others and reaches the producer on both of
+        // its branches.
         if (bothReach && bi.isLess(condBlock, lastValidDominator)) {
           lastValidDominator = condBlock;
         }
@@ -1975,6 +2040,24 @@ void ftd::insertDirectSuppression(
       currentMuxOp = nextMuxOp;
     }
     dominatorBlock = lastValidDominator;
+
+    // dominatorBlock must dominate the producer and every block whose branch
+    // condition the suppression depends on, so take the nearest common
+    // dominator of all of them.
+    SmallVector<Block *> exprCondBlocks =
+        collectSuppressionConditionBlocks(producerBlock, consumerBlock, bi);
+    if (!exprCondBlocks.empty()) {
+      DominanceInfo domInfo;
+      Block *bd =
+          domInfo.findNearestCommonDominator(producerBlock, dominatorBlock);
+      for (Block *cb : exprCondBlocks) {
+        if (!bd)
+          break;
+        bd = domInfo.findNearestCommonDominator(bd, cb);
+      }
+      if (bd)
+        dominatorBlock = bd;
+    }
   }
 
   // Create a temporary builder to isolate the LocalCFG creation from the
@@ -2273,6 +2356,82 @@ void ftd::insertDirectSuppression(
   level0ConstrainedDG->containerOp->erase();
   fullDecisionGraph->containerOp->erase();
 
+  // Loop filter: when the producer sits in a deeper loop than dominatorBlock,
+  // it can fire several times per delivery, producing extra tokens the branch
+  // below cannot match. Keep only the token of the iteration that reaches the
+  // loop exit — the block at dominatorBlock's loop depth that post-dominates
+  // the producer — and discard the rest.
+  if (producerBlock && dominatorBlock) {
+    DominanceInfo lfDom;
+    mlir::CFGLoopInfo lfLoopInfo(lfDom.getDomTree(&shadowRegion));
+    auto loopDepth = [&](Block *b) -> unsigned {
+      if (mlir::CFGLoop *l = lfLoopInfo.getLoopFor(b))
+        return l->getLoopDepth();
+      return 0;
+    };
+
+    unsigned domLevel = loopDepth(dominatorBlock);
+    unsigned prodLevel = loopDepth(producerBlock);
+
+    if (prodLevel > domLevel) {
+      // Walk up the post-dominator tree from the producer to the nearest
+      // block that sits at the dominator's loop level: that block is the
+      // loop exit whose iteration token we want to keep.
+      mlir::PostDominanceInfo lfPostDom;
+      auto &pdt = lfPostDom.getDomTree(&shadowRegion);
+      Block *filterBB = nullptr;
+      if (auto *node = pdt.getNode(producerBlock)) {
+        for (node = node->getIDom(); node && node->getBlock();
+             node = node->getIDom()) {
+          if (loopDepth(node->getBlock()) == domLevel) {
+            filterBB = node->getBlock();
+            break;
+          }
+        }
+      }
+
+      if (filterBB && filterBB != producerBlock) {
+        // Compute the condition for the producer reaching that exit and use it
+        // to discard every producer token except the exit-reaching one.
+        OpBuilder lfBuilder(funcOp.getContext());
+        auto lfLoc = buildLocalCFGRegion(lfBuilder, producerBlock, filterBB, bi);
+        if (lfLoc->newCons) {
+          ControlDependenceAnalysis lfLocCDA(*lfLoc->region);
+          DenseSet<Block *> lfDepsTmp =
+              lfLocCDA.getAllBlockDeps()[lfLoc->newCons].allControlDeps;
+          auto lfDG = buildDecisionGraph(*lfLoc, lfDepsTmp);
+
+          ControlDependenceAnalysis lfDGCDA(*lfDG->region);
+          DenseSet<Block *> lfDeps =
+              lfDGCDA.getAllBlockDeps()[lfDG->newCons].allControlDeps;
+
+          BoolExpression *lfCons = enumeratePaths(*lfDG, bi, lfDeps);
+          BoolExpression *lfSup =
+              lfCons->boolMinimize()->boolNegate()->boolMinimize();
+
+          if (lfSup->type != experimental::boolean::ExpressionType::Zero) {
+            DenseMap<Block *, unsigned> lfRank = computeTopoRank(*lfDG);
+            // The filter operates on the producer's token, so its circuit
+            // belongs to the producer's basic block.
+            Value lfCond =
+                expressionToCircuit(builder, lfSup, lfRank, producerIRBlock,
+                                    registry, bi, nullptr, &shadow, prodBBAttr);
+            auto lfBranch = builder.create<handshake::ConditionalBranchOp>(
+                consumer->getLoc(), ftd::getListTypes(supData.getType()),
+                lfCond, supData);
+            lfBranch->setAttr(FTD_OP_TO_SKIP, builder.getUnitAttr());
+            lfBranch->setAttr("handshake.bb", prodBBAttr);
+            // Pass the token through only when the exit is reached (the
+            // suppression select is false on the final iteration).
+            supData = lfBranch.getFalseResult();
+          }
+          lfDG->containerOp->erase();
+        }
+        lfLoc->containerOp->erase();
+      }
+    }
+  }
+
   // If the activation function is not zero, then a suppress block is to be
   // inserted
   if (fSup->type != experimental::boolean::ExpressionType::Zero) {
@@ -2331,6 +2490,13 @@ void ftd::insertDirectSuppression(
         continue;
       }
       use.set(supData);
+    }
+  } else if (supData != connection) {
+    // No main suppression was needed, but the loop filter rewrote the
+    // producer token; route the filtered token to the consumer.
+    for (auto &use : llvm::make_early_inc_range(connection.getUses())) {
+      if (use.getOwner() == consumer)
+        use.set(supData);
     }
   }
   locGraph->containerOp->erase();
