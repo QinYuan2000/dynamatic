@@ -6,13 +6,10 @@
 //
 //===----------------------------------------------------------------------===//
 //
-// Declares the core functions to run the Fast Token Delivery algorithm,
-// according to the original FPL'22 paper by Elakhras et al.
-// (https://ieeexplore.ieee.org/document/10035134).
-//
-// This file contains the top-level algorithm orchestration (GSA conversion,
-// regeneration, suppression dispatch, phi networks). The suppression circuit
-// construction infrastructure lives in FtdSuppression.h.
+// Declares the top-level steps of the Fast Token Delivery (FTD) algorithm:
+// converting phi functions to GSA gates, regeneration, suppression dispatch,
+// and condition placeholders. The suppression circuit construction itself 
+// lives in FtdSuppression.h.
 //
 //===----------------------------------------------------------------------===//
 
@@ -61,8 +58,7 @@ void addSuppOperandConsumer(mlir::OpBuilder &builder, handshake::FuncOp &funcOp,
 /// When the consumer is in a loop while the producer is not, the value must
 /// be regenerated as many times as needed. This function is in charge of
 /// adding some merges to the network, so that this can be done. The new
-/// merge is moved inside of the loop, and it works like a reassignment
-/// (cfr. FPL'22, Section V.C).
+/// merge is moved inside of the loop, and it works like a reassignment.
 void addRegen(handshake::FuncOp &funcOp, mlir::OpBuilder &builder,
                  ShadowCFG &shadow);
 
@@ -70,7 +66,7 @@ void addRegen(handshake::FuncOp &funcOp, mlir::OpBuilder &builder,
 /// producer might create a token which is never used by the corresponding
 /// consumer, because of the control decisions. In this scenario, the token
 /// must be suppressed. This function inserts a `SUPPRESS` block whenever it
-/// is necessary, according to FPL'22 (IV.C and V)
+/// is necessary.
 void addSupp(handshake::FuncOp &funcOp, mlir::OpBuilder &builder,
              ShadowCFG &shadow);
 

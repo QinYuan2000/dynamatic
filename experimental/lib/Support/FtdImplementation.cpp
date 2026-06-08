@@ -49,6 +49,7 @@ void ftd::resolveCondPlaceholders(handshake::FuncOp funcOp,
                                   ftd::ShadowCFG &shadow) {
   Block &entryBlock = funcOp.getBody().front();
 
+  // Collect the condition placeholders (the tagged constants) in the entry.
   SmallVector<Operation *> placeholders;
   for (Operation &op : entryBlock) {
     if (isa<handshake::ConstantOp>(&op) && op.hasAttr(FTD_COND_VAR))
@@ -61,6 +62,7 @@ void ftd::resolveCondPlaceholders(handshake::FuncOp funcOp,
       continue;
     unsigned bbIdx = bbAttr.getUInt();
 
+    // The real handshake condition this placeholder stands for.
     Value realCond = shadow.getCondition(bbIdx);
     if (!realCond)
       continue;
@@ -73,6 +75,8 @@ void ftd::resolveCondPlaceholders(handshake::FuncOp funcOp,
     Location loc = ph->getLoc();
     Type chanI1 = ftd::channelifyType(builder.getI1Type());
 
+    // Forward the real condition through a NotIOp that keeps the placeholder
+    // tag, so finalizeCondPlaceholders can later short-circuit and remove it.
     auto notOp = builder.create<handshake::NotIOp>(
         loc, chanI1, realCond);
     notOp->setAttr(FTD_COND_VAR, builder.getUnitAttr());
@@ -113,7 +117,7 @@ static Block *getImmediateDominator(Region &region, Block *bb) {
   if (region.getBlocks().empty())
     return nullptr;
 
-  // The first block in the CFG has both non predecessors and no dominators
+  // The first block in the CFG has both no predecessors and no dominators
   if (bb->hasNoPredecessors())
     return nullptr;
 
@@ -151,7 +155,8 @@ getDominanceFrontier(Region &region) {
     if (numberOfPredecessors < 2)
       continue;
 
-    // Run the algorithm as explained in the paper
+    // For each predecessor, walk up the dominator tree, adding bb to the
+    // frontier of every block until bb's immediate dominator is reached.
     for (auto *pred : predecessors) {
       Block *runner = pred;
       // Runner performs a bottom up traversal of the dominator tree

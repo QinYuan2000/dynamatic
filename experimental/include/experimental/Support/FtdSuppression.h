@@ -6,15 +6,14 @@
 //
 //===----------------------------------------------------------------------===//
 //
-// Declares the suppression infrastructure for the Fast Token Delivery (FTD)
-// algorithm. This includes:
-//   1. Local CFG construction and decision graph extraction.
-//   2. Cyclic analysis (LoopScope hierarchy, layered CFG extraction).
-//   3. Boolean expression → BDD → circuit conversion.
-//   4. Token distribution and cyclic demotion.
-//   5. The insertDirectSuppression entry point.
+// Public interface for suppression: building the circuitry that discards a
+// producer's data token on the executions where its consumer will not use it.
 //
-// Corresponds to Chapter 5 of the thesis.
+// The entry point is insertDirectSuppression; the remaining declarations are
+// the data structures and building blocks it relies on (local CFG and decision
+// graph types, loop analysis, Boolean-condition-to-circuit conversion, token
+// distribution, and cyclic demotion). See FtdSuppression.cpp for how these fit
+// together.
 //
 //===----------------------------------------------------------------------===//
 
@@ -171,7 +170,8 @@ private:
 // Distribution data structures
 // ===--------------------------------------------------------------------=== //
 
-/// FTD Distribution Logic
+/// One branch decision along a path: condition variable `var` resolved to
+/// `value` (which way the branch went).
 struct PathStep {
   std::string var;
   bool value;
@@ -182,8 +182,11 @@ struct PathStep {
   bool operator!=(const PathStep &other) const { return !(*this == other); }
 };
 
+/// A path through the control flow, given as the branch decisions taken.
 using PathContext = std::vector<PathStep>;
 
+/// A request for the token of condition variable `varName` on the path `path`.
+/// Used while routing condition tokens to the muxes that consume them.
 struct VariableRequirement {
   std::string varName;
   PathContext path;
@@ -209,15 +212,18 @@ struct SignalRegistry {
 /// Helper struct encapsulating cyclic demotion logic for reuse across
 /// different suppression contexts (direct suppression and MU gate exit).
 struct CyclicDemotionHelper {
+  // Context supplied by the caller (the suppression driver):
   mlir::OpBuilder &builder;
   MLIRContext *ctx;
   const BlockIndexing &bi;
-  CyclicGraphManager &cyclicMgr;
-  DenseMap<Block *, Block *> &origToFullDG;
+  CyclicGraphManager &cyclicMgr; // source of loop scopes and layered CFGs
+  DenseMap<Block *, Block *> &origToFullDG; // original block -> decision-graph block
   Location loc;
-  Block *insertBlock;
+  Block *insertBlock; // basic block the emitted ops are tagged to
   DenseMap<Value, SmallVector<Backedge, 2>> *pendingMuxOperands;
   ShadowCFG *shadow;
+  // Caches one demoted value per (condition variable, target level) so the
+  // same demotion circuit is not built twice.
   std::map<std::pair<std::string, unsigned>, Value> demotionCache;
 
   CyclicDemotionHelper(mlir::OpBuilder &builder, MLIRContext *ctx,

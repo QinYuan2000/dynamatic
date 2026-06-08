@@ -60,6 +60,7 @@ ftd::BlockIndexing::getBlockFromIndex(unsigned index) const {
 
 std::optional<Block *>
 ftd::BlockIndexing::getBlockFromCondition(StringRef condition) const {
+  // Conditions are named "cN"; drop the leading 'c' and parse the index N.
   std::string conditionNumber = condition.str();
   conditionNumber.erase(0, 1);
   StringRef conditionRef = conditionNumber;
@@ -250,7 +251,7 @@ ftd::getPathExpression(ArrayRef<Block *> path,
     }
   }
 
-  // Minimize the condition and return
+  // Return the path condition (minimization is left to the caller)
   return exp;
 }
 
@@ -344,10 +345,14 @@ void ftd::setBBAttrWithFallback(Operation *op, IntegerAttr bbAttr,
 // ===--------------------------------------------------------------------=== //
 
 Value ftd::getOrCreateCondPlaceholder(Block *condBlock, OpBuilder &builder) {
+  // Reuse the placeholder already created for this block, if any.
   for (Operation &op : *condBlock) {
     if (isa<handshake::ConstantOp>(&op) && op.hasAttr(FTD_COND_VAR))
       return op.getResult(0);
   }
+  // Otherwise create a source -> constant pair standing in for the block's
+  // condition. The constant carries FTD_COND_VAR (it is the placeholder), and
+  // both ops carry FTD_OP_TO_SKIP so the FTD passes leave them alone.
   OpBuilder::InsertionGuard guard(builder);
   builder.setInsertionPointToStart(condBlock);
   auto sourceOp =

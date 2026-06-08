@@ -72,6 +72,7 @@ CyclicGraphManager::buildScopeRecursive(mlir::CFGLoop *loop, unsigned level) {
   scope->loopInfo = loop;
   scope->header = loop->getHeader();
 
+  // Latches are the blocks that jump back to the header; each is a back edge.
   SmallVector<Block *> latches;
   loop->getLoopLatches(latches);
   scope->latches = latches;
@@ -87,6 +88,7 @@ CyclicGraphManager::buildScopeRecursive(mlir::CFGLoop *loop, unsigned level) {
     blockLevelMap[b] = level;
   }
 
+  // Recurse into nested loops at the next level and bubble their back edges up.
   for (auto *subLoop : loop->getSubLoops()) {
     auto subScope = buildScopeRecursive(subLoop, level + 1);
     subScope->parent = scope.get();
@@ -100,16 +102,19 @@ CyclicGraphManager::buildScopeRecursive(mlir::CFGLoop *loop, unsigned level) {
 
 void CyclicGraphManager::analyzeTopology() {
   blockLevelMap.clear();
+  // Level 0 is the acyclic top-level scope; its header stands for the entry.
   topLevelScope = std::make_unique<LoopScope>();
   topLevelScope->level = 0;
   topLevelScope->header = lcfg.newProd;
   topLevelScope->loopInfo = nullptr;
 
+  // Start every block at level 0; loop members are raised while building scopes.
   for (Block &b : lcfg.region->getBlocks()) {
     topLevelScope->allBlocksInclusive.insert(&b);
     blockLevelMap[&b] = 0;
   }
 
+  // One scope per top-level loop; collect their back edges into the root.
   auto topLoops = loopInfo.getTopLevelLoops();
   for (auto *loop : topLoops) {
     auto subScope = buildScopeRecursive(loop, 1);
@@ -502,6 +507,10 @@ static Block *returnMuxConditionBlock(Value muxCondition,
   }
 }
 
+/// When the consumer is a loop header that contains the producer, suppression
+/// circuitry is better placed at the loop's exit than at the producer's block.
+/// Returns the handshake.bb attribute of that first exit block, or an empty
+/// attribute when this situation does not apply.
 static IntegerAttr getFirstLoopExitBBAttrIfHeaderConsumer(
     OpBuilder &builder, Region &region, Block *producerBlock, Block *consumerBlock,
     const ftd::BlockIndexing &bi, ftd::ShadowCFG &shadow) {
@@ -1143,6 +1152,7 @@ void ftd::buildDistributionNetwork(mlir::OpBuilder &builder,
 DenseMap<Block *, unsigned> ftd::computeTopoRank(const LocalCFG &lcfg) {
   DenseMap<Block *, unsigned> rank;
   unsigned i = 0;
+  // Number each original block by its position in topological order.
   for (Block *b : lcfg.topoOrder)
     if (auto *ob = lcfg.origMap.lookup(b))
       rank[ob] = i++;
@@ -1156,6 +1166,8 @@ Value ftd::expressionToCircuit(
     DenseMap<Value, SmallVector<Backedge, 2>> *pendingMuxOperands,
     ShadowCFG *shadow, IntegerAttr forcedBBAttr) {
 
+  // Minimize, order the variables by block position (the BDD variable order),
+  // build the BDD, and lower it to a mux tree.
   expr = expr->boolMinimize();
   std::set<std::string> vars = expr->getVariables();
 
@@ -1691,6 +1703,8 @@ CyclicDemotionHelper::CyclicDemotionHelper(
       shadow(shadow) {}
 
 unsigned CyclicDemotionHelper::getVarNativeLevel(const std::string &var) {
+    // Map the condition variable to its block, then to the decision-graph
+    // block, and read that block's loop-nesting level.
     auto opt = bi.getBlockFromCondition(var);
     if (!opt)
       return 0;
@@ -1706,6 +1720,7 @@ LoopScope *CyclicDemotionHelper::findScopeForBlock(Block *origIRBlock,
     if (it == origToFullDG.end())
       return nullptr;
     Block *dgBlock = it->second;
+    // Walk the scope tree for the scope at `level` that contains the block.
     std::function<ftd::LoopScope *(ftd::LoopScope *)> search;
     search = [&](ftd::LoopScope *s) -> ftd::LoopScope * {
       if (s->level == level && s->allBlocksInclusive.contains(dgBlock))
@@ -1919,8 +1934,11 @@ collectSuppressionConditionBlocks(Block *producerBlock, Block *consumerBlock,
 // insertDirectSuppression — main suppression entry point
 // ===--------------------------------------------------------------------=== //
 
-/// Apply the algorithm from FPL'22 to handle a non-loop situation of
-/// producer and consumer
+/// Builds the suppression circuit for a single producer value consumed by
+/// `consumer`. In outline: pick the block the analysis starts from, reconstruct
+/// the control flow down to the consumer, derive the condition under which the
+/// token must be discarded, emit the mux-tree circuit for that condition, and
+/// branch the producer token on it so the unused token is dropped.
 void ftd::insertDirectSuppression(
     mlir::OpBuilder &builder, handshake::FuncOp &funcOp, Operation *consumer,
     Value connection, ftd::ShadowCFG &shadow) {
@@ -1937,6 +1955,8 @@ void ftd::insertDirectSuppression(
     consBBIdx = attr.getUInt();
   IntegerAttr prodBBAttr =
       ftd::getBBIndexAttr(builder.getContext(), prodBBIdx);
+  // Suppression ops are tagged to the producer's block by default; if the
+  // consumer is an enclosing loop header, place them at the loop exit instead.
   IntegerAttr targetBBAttr = prodBBAttr;
   Block *producerIRBlock =
       connection.getDefiningOp() ? connection.getDefiningOp()->getBlock()
@@ -2191,7 +2211,10 @@ void ftd::insertDirectSuppression(
     }
   }
 
+  // No branch decision affects delivery here.
   if (locConsControlDepsFull.empty()) {
+    // The consumer is never reached on any kept path: discard the token on
+    // every execution with an always-true suppression select.
     if (locGraph->newCons == locGraph->sinkBB) {
       builder.setInsertionPointToStart(consumer->getBlock());
       auto src = builder.create<handshake::SourceOp>(consumer->getLoc());
@@ -2305,17 +2328,22 @@ void ftd::insertDirectSuppression(
   DenseSet<Block *> constrainedDeps =
       decCDA.getAllBlockDeps()[level0ConstrainedDG->newCons].allControlDeps;
 
+  // fCons is the condition under which the consumer actually uses the token;
+  // its negation, fSup, is when the token must be discarded.
   BoolExpression *fCons =
       enumeratePaths(*level0ConstrainedDG, bi, constrainedDeps);
 
   fCons = fCons->boolMinimize();
-  // f_supp = f_prod and not f_cons
   BoolExpression *fSup = fCons->boolNegate();
   fSup = fSup->boolMinimize();
 
-  // Suppression Logic between Dominator and Producer (locGraphDP)
+  // The start block can be above the producer, so the producer does not fire
+  // on every path that reaches it. fSupDP is the suppression condition for the
+  // start-block-to-producer stretch; it is used to drop the parts of the main
+  // condition where the producer never fires. Zero when the start block is the
+  // producer itself.
   BoolExpression *fSupDP = BoolExpression::boolZero();
-  DenseMap<Block *, unsigned> rankDP;  // pre-computed rank for DP graph
+  DenseMap<Block *, unsigned> rankDP;  // pre-computed rank for this sub-graph
 
   if (dominatorBlock != producerBlock) {
     OpBuilder tmpBuilder2(funcOp.getContext());
@@ -2323,7 +2351,6 @@ void ftd::insertDirectSuppression(
                                           producerBlock, bi);
 
     if (locGraphDP->newCons) {
-      // Build fullDecisionGraph for DP path
       ControlDependenceAnalysis dpLocCDA(*locGraphDP->region);
       DenseSet<Block *> dpDepsTmp =
           dpLocCDA.getAllBlockDeps()[locGraphDP->newCons].allControlDeps;
