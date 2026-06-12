@@ -1,0 +1,54 @@
+<mxfile host="app.diagrams.net">
+  <diagram id="ftd-suppression-pipeline" name="suppression-pipeline">
+    <mxGraphModel dx="900" dy="700" grid="1" gridSize="10" guides="1" tooltips="1" connect="1" arrows="1" fold="1" page="1" pageScale="1" pageWidth="850" pageHeight="900" math="0" shadow="0">
+      <root>
+        <mxCell id="0" />
+        <mxCell id="1" parent="0" />
+
+        <!-- Main chain -->
+        <mxCell id="s1" value="&lt;b&gt;buildLocalCFGRegion&lt;/b&gt;&#10;reconstruct the control flow between producer and consumer" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#dae8fc;strokeColor=#6c8ebf;" vertex="1" parent="1">
+          <mxGeometry x="60" y="40" width="300" height="60" as="geometry" />
+        </mxCell>
+        <mxCell id="s2" value="&lt;b&gt;buildDecisionGraph&lt;/b&gt;&#10;keep only the branches that decide delivery" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#dae8fc;strokeColor=#6c8ebf;" vertex="1" parent="1">
+          <mxGeometry x="60" y="140" width="300" height="60" as="geometry" />
+        </mxCell>
+        <mxCell id="s3" value="&lt;b&gt;CyclicGraphManager&lt;/b&gt;&#10;one acyclic layer per loop nesting level" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#dae8fc;strokeColor=#6c8ebf;" vertex="1" parent="1">
+          <mxGeometry x="60" y="240" width="300" height="60" as="geometry" />
+        </mxCell>
+        <mxCell id="s4" value="&lt;b&gt;enumeratePaths&lt;/b&gt;&#10;paths &amp;rarr; f_cons ;  f_supp = &amp;not;f_cons" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#dae8fc;strokeColor=#6c8ebf;" vertex="1" parent="1">
+          <mxGeometry x="60" y="340" width="300" height="60" as="geometry" />
+        </mxCell>
+        <mxCell id="s5" value="&lt;b&gt;expressionToCircuit&lt;/b&gt;&#10;buildBDD + bddToCircuit: Boolean &amp;rarr; MUX tree" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#dae8fc;strokeColor=#6c8ebf;" vertex="1" parent="1">
+          <mxGeometry x="60" y="440" width="300" height="60" as="geometry" />
+        </mxCell>
+        <mxCell id="s6" value="&lt;b&gt;insertDirectSuppression&lt;/b&gt;&#10;compose f_DC, f_DP, loop filter; emit the suppression BRANCH" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#d5e8d4;strokeColor=#82b366;" vertex="1" parent="1">
+          <mxGeometry x="60" y="560" width="300" height="60" as="geometry" />
+        </mxCell>
+
+        <!-- Side: token plumbing -->
+        <mxCell id="t1" value="&lt;b&gt;buildDistributionNetwork&lt;/b&gt;&#10;split condition tokens per path (read-once)" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#ffe6cc;strokeColor=#d79b00;" vertex="1" parent="1">
+          <mxGeometry x="480" y="290" width="280" height="60" as="geometry" />
+        </mxCell>
+        <mxCell id="t2" value="&lt;b&gt;CyclicDemotionHelper&lt;/b&gt;&#10;one representative token per loop level" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#ffe6cc;strokeColor=#d79b00;" vertex="1" parent="1">
+          <mxGeometry x="480" y="190" width="280" height="60" as="geometry" />
+        </mxCell>
+        <mxCell id="t3" value="&lt;b&gt;SignalRegistry&lt;/b&gt;&#10;variable &amp;rarr; signal per PathContext&#10;(longest-prefix lookup)" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#f5f5f5;strokeColor=#666666;dashed=0;" vertex="1" parent="1">
+          <mxGeometry x="480" y="410" width="280" height="70" as="geometry" />
+        </mxCell>
+
+        <!-- Main chain edges -->
+        <mxCell id="e1" style="edgeStyle=orthogonalEdgeStyle;html=1;" edge="1" parent="1" source="s1" target="s2"><mxGeometry relative="1" as="geometry" /></mxCell>
+        <mxCell id="e2" style="edgeStyle=orthogonalEdgeStyle;html=1;" edge="1" parent="1" source="s2" target="s3"><mxGeometry relative="1" as="geometry" /></mxCell>
+        <mxCell id="e3" style="edgeStyle=orthogonalEdgeStyle;html=1;" edge="1" parent="1" source="s3" target="s4"><mxGeometry relative="1" as="geometry" /></mxCell>
+        <mxCell id="e4" style="edgeStyle=orthogonalEdgeStyle;html=1;" edge="1" parent="1" source="s4" target="s5"><mxGeometry relative="1" as="geometry" /></mxCell>
+        <mxCell id="e5" style="edgeStyle=orthogonalEdgeStyle;html=1;" edge="1" parent="1" source="s5" target="s6"><mxGeometry relative="1" as="geometry" /></mxCell>
+
+        <!-- Plumbing edges -->
+        <mxCell id="e6" value="layered CFGs" style="edgeStyle=orthogonalEdgeStyle;html=1;dashed=1;" edge="1" parent="1" source="s3" target="t2"><mxGeometry relative="1" as="geometry" /></mxCell>
+        <mxCell id="e7" value="register demoted values" style="edgeStyle=orthogonalEdgeStyle;html=1;dashed=1;" edge="1" parent="1" source="t2" target="t3"><mxGeometry relative="1" as="geometry" /></mxCell>
+        <mxCell id="e8" value="register split copies" style="edgeStyle=orthogonalEdgeStyle;html=1;dashed=1;" edge="1" parent="1" source="t1" target="t3"><mxGeometry relative="1" as="geometry" /></mxCell>
+        <mxCell id="e9" value="select lookup by PathContext" style="edgeStyle=orthogonalEdgeStyle;html=1;dashed=1;" edge="1" parent="1" source="t3" target="s5"><mxGeometry relative="1" as="geometry" /></mxCell>
+      </root>
+    </mxGraphModel>
+  </diagram>
+</mxfile>
