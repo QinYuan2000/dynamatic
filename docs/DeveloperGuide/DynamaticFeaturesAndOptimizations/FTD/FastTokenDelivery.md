@@ -1,26 +1,27 @@
 # Fast Token Delivery
 
-This document describes the Fast Token Delivery (FTD) algorithm and its implementation across `FtdSupport`, `FtdImplementation`, and `FtdSuppression`. FTD runs on a Handshake function and inserts the circuitry that delivers each produced value to the operations that consume it: dropping tokens on executions where they would not be used, and replaying tokens on executions where they are needed more than once.
+This document describes the Fast Token Delivery (FTD) algorithm and its implementation across `FtdSupport`, `FtdImplementation`, and `FtdSuppression`. FTD runs on a Handshake function and inserts the circuitry that delivers each produced value to the operations that consume it: suppressing tokens on executions where they would not be consumed, and regenerating tokens on executions where they are needed more than once.
 
-The bulk of the algorithm, and of this document, is the **suppression** machinery (`FtdSuppression`) that computes the discard condition for one producer–consumer pair and builds it as a circuit that itself respects token matching. Regeneration, GSA gate conversion, and the supporting infrastructure are smaller and are covered after it.
+The bulk of the algorithm, and of this document, is the **suppression** machinery (`FtdSuppression`) that computes the discard condition for one producer–consumer pair and builds it as a circuit that itself respects the token-matching invariants. Regeneration, GSA gate conversion, and the supporting infrastructure are smaller and are covered after it.
 
 ## Background
 
-### Dataflow circuits and token matching
+### Elastic circuits and the token delivery problem
 
-Dynamatic compiles C into a dynamically scheduled dataflow circuit. There is no global schedule; values travel as **tokens** over handshake channels, and an operation fires when its inputs are present and its output can be accepted. Every data dependency in the program is a **producer → consumer** pair: one operation defines a value, another reads it.
+Dynamatic compiles C/C++ into **elastic** (dataflow) circuits: synchronous circuits in which every data signal is accompanied by handshake signals. A **token** abstracts a data signal together with its handshake; tokens flow from a **producer** to a **consumer** through an elastic channel as quickly as data availability and the readiness of the consumer allow, with no predefined schedule. Tokens carry no tags: within each channel, their *order* is what identifies which piece of data each token represents — for example, to which loop iteration it belongs. One component behaves specially, and the construction below leans on it: a MUX consumes a token on its select input and on the *selected* data input only, leaving any token on the deselected input waiting.
 
-The property the circuit must preserve is **token matching**: at every operation, the inputs that fire together must correspond to the same logical execution. In a sequential program the compiler guarantees this; in a dataflow circuit, where control flow is resolved at run time, two things go wrong on their own:
+In gated form every use of a value has a single reaching definition, so each data dependency is one producer–consumer pair. Control flow is resolved at run time, so there is in general no guarantee that control ever reaches the producer's block, the consumer's block, or both: independently, a token may or may not be produced, and a token may or may not be consumed. The circuit is correct only under the **token-matching invariants**: every token produced must eventually be consumed, and every token consumed must have been produced — and since tokens are identified only by their order in a channel, a single unmatched token corrupts the meaning of every token behind it. The mismatches come in three shapes:
 
-- A branch is not taken, but the producer already emitted a token the consumer will not read. The surplus token stays in the channel and desynchronizes every later token. It must be **discarded**.
-- The consumer is inside a loop the producer is not in. The producer fires once, but the consumer reads the value every iteration. The single token must be **replayed** once per iteration.
+- the producer fires but control flow never reaches the consumer — the token must be **suppressed** (discarded);
+- the producer sits inside a loop and the consumer outside it — a token is produced on every iteration but only the last one is consumed, so all the others must be suppressed;
+- the producer sits outside a loop and the consumer inside it — a single token is produced but one is consumed per iteration, so the token must be **regenerated** each time the loop iterates.
 
-FTD fixes both with two primitives placed on the producer→consumer channel:
+FTD inserts two kinds of control circuitry on producer→consumer channels:
 
-- **Suppression** is a `handshake::ConditionalBranchOp` whose select is a Boolean *suppression condition* `f_supp`. The branch's *true* output is left dangling (a sink) and its *false* output feeds the consumer: when `f_supp` is true the token is discarded, when false it is delivered. Equivalently the circuit can compute the *consumption condition* `f_cons = ¬f_supp` with the outputs swapped; the code and the figures use whichever form reads better at each point, and the two are always negations of each other.
-- **Regeneration** is a `handshake::MuxOp` at a loop header with a feedback edge: the first iteration forwards the external token, later iterations forward the mux's own previous output.
+- **Suppression**: a BRANCH whose discard output feeds a SINK. Its select carries the Boolean *suppression condition* `f_supp`: when the select token is true the data token is discarded, when false it is delivered. Equivalently the circuit can compute the *consumption condition* `f_cons = ¬f_supp` with the outputs swapped; the code and the figures use whichever form reads better at each point, and the two are always negations of each other. In the IR this is a `handshake::ConditionalBranchOp`, with the fixed convention that the **false output delivers** and the true output is sunk.
+- **Regeneration**: a MUX at the loop header whose select is the loop exit condition fed through an INIT component (which emits one initial token before the condition stream): the first iteration selects the value arriving from outside the loop, every later iteration selects the value fed back from inside, until the loop exits. In the IR: `handshake::MuxOp` + `handshake::InitOp`.
 
-The hard part is computing `f_supp` *and emitting it as a circuit that itself satisfies token matching*. The condition is evaluated from **condition tokens** — the run-time outputs of the conditional blocks — and those tokens arrive once per branch execution, on specific paths, possibly once per loop iteration. A naive expression circuit re-reads the same condition token on several paths and breaks matching internally. Most of the suppression pipeline (distribution, demotion) exists to prevent exactly that.
+The difficulty is not stating `f_supp` — it is a Boolean over the branch conditions `cN` — but evaluating it with tokens. Each conditional block emits one **condition token** per execution, so a literal's token may simply never arrive: if block 0's condition `c0` guards block 1 with condition `c1`, then whenever `c0` is true block 1 never executes and no `c1` token is ever produced. A naive elastic logic gate computing `f_supp = ¬c0·¬c1` would wait forever for that token, and the circuit deadlocks. The remedy is to evaluate the expression by successive Shannon expansion as a tree of MUXes: a MUX never consumes its deselected input, so a missing token is never waited for. This is why every Boolean condition in FTD is lowered through a BDD into a mux tree (§3.5) — and building those trees so they remain correct across loops and shared condition tokens is what the rest of the suppression pipeline (§3.6–§3.7) is for.
 
 ### Block indexing and condition variables
 
@@ -309,9 +310,9 @@ Three details are load-bearing. First, the select is fetched from the `SignalReg
 
 ### 3.6 Token distribution — making the mux tree read-once
 
-This stage is what makes the suppression circuit itself satisfy token matching, and it is the reason the algorithm is more than "build a BDD."
+This stage is what makes the suppression circuit itself satisfy the token-matching invariants, and it is the reason the algorithm is more than "build a BDD."
 
-**The problem.** A BDD-derived mux tree is generally **not read-once**: a BDD vertex can be reachable from the root along several distinct paths, so the same condition variable labels several mux inputs. A condition token, however, is produced *once* per branch execution. Fanning the single physical wire out to all those inputs feeds tokens at the wrong rate and on the wrong paths — muxes deadlock or pair tokens from different executions. The Boolean is correct; the token behavior is not.
+**The problem.** A BDD-derived mux tree is generally **not read-once**: a BDD vertex can be reachable from the root along several distinct paths, so the same condition variable labels several mux inputs. A condition token, however, is produced *once* per execution of its block, and a MUX consumes a token on its selected input only — a token forked to a deselected input is left waiting and would be paired with a *later* execution's selection. The token-matching of the mux tree therefore requires the **read-once property**: every variable labels at most one mux input. The Boolean is correct either way; the token behavior is not.
 
 <img src="./Figures/ch5_4_l0bddmux.png" width="620"/>
 
@@ -635,6 +636,6 @@ FTD tags the IR to recognize its own operations and to drive block-level decisio
 - **`handshake.bb` must be correct on every FTD-created op.** `setBBAttr` / `setBBAttrWithFallback` / `getBBIndexAttr` exist to keep it consistent; a wrong index silently corrupts placement and loop-depth decisions.
 - **Preserve the local-CFG property** (§3.1, property 4): reaching `newCons` means deliver, reaching `sinkBB` means discard. Most subtle suppression bugs trace back to violating it.
 - **The branch convention is fixed.** Suppression and filter branches deliver on their false output and discard on their true output; expect `getFalseResult()` wherever a surviving token is rewired. Figures drawn in consumption form are the same circuit with the select negated.
-- **Read-once is the correctness criterion for the expression circuit.** If a change lets one condition variable drive two mux inputs on the same path, distribution has been bypassed and token matching fails at run time even though the Boolean is correct.
+- **Read-once is the correctness criterion for the expression circuit.** If a change lets one condition variable drive two mux inputs on the same path, distribution has been bypassed and the token-matching invariants are violated at run time even though the Boolean is correct.
 - **Distribution before constraints.** The network is always built on the unconstrained graph and the Boolean on the constrained one; building the network on the constrained graph drops copies that other paths still need.
 - **Irreducible loops** are handled by the residual-back-edge check in `extractLayeredCFG` (topological-order test), not by `CFGLoopInfo` alone.
