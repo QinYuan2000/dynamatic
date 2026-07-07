@@ -125,6 +125,20 @@ void pls_label(pPLA PLA, FILE *fp) {
 
 /*
     eqntott output mode -- output algebraic equations
+
+    FIX (heap-buffer-overflow): this function grows `output` with realloc, but
+    the original capacity check did not cover every strcat -- the literals "(",
+    " | (", "&", "!", ")" and ";\n\n" were appended without first ensuring room,
+    and `current_length` was updated inconsistently (it under-counted). For a
+    large equation (e.g. kmp's phi condition: 13 variables, many product terms)
+    the string crossed the buffer boundary between capacity checks and one of
+    those uncounted strcats wrote past the buffer, corrupting the heap. This is
+    the AddressSanitizer "heap-buffer-overflow / WRITE of size 5 / 0 bytes after
+    1024-byte region" at eqn_output.
+
+    Every append now goes through eqn_append(), which grows the buffer as needed
+    and keeps current_length exactly in sync with the real string length. The
+    output formatting is unchanged.
 */
 char *eqn_output(pPLA PLA) {
   pcube p, last;
@@ -148,21 +162,32 @@ char *eqn_output(pPLA PLA) {
   output[0] = '\0';
   size_t current_length = 0; // To track the current length of the string
 
+  // Safely append `src` to `output`, growing the buffer as needed and keeping
+  // current_length in sync with the actual string length. On allocation
+  // failure, frees the buffer and reports failure so the caller returns NULL.
+  auto eqn_append = [&](const char *src) -> bool {
+    size_t addLen = strlen(src);
+    while (current_length + addLen + 1 > output_size) { // +1 for '\0'
+      output_size *= 2;
+      char *grown = (char *)realloc(output, output_size);
+      if (grown == NULL) {
+        free(output);
+        output = NULL;
+        return false;
+      }
+      output = grown;
+    }
+    memcpy(output + current_length, src, addLen + 1); // copies terminating '\0'
+    current_length += addLen;
+    return true;
+  };
+
   /* Write a single equation for each output */
   for (i = 0; i < cube.part_size[cube.output]; i++) {
-    // printf("%s = ", OUTLABEL(i));
     char temp[256];
-    int temp_length = snprintf(temp, sizeof(temp), "%s = ", OUTLABEL(i));
-    current_length += temp_length;
-    // Check if buffer needs to be resized
-    if (current_length >= output_size) {
-      output_size *= 2;
-      output = (char *)realloc(output, output_size);
-      if (output == NULL) {
-        return NULL; // Memory reallocation failed
-      }
-    }
-    strcat(output, temp);
+    (void)snprintf(temp, sizeof(temp), "%s = ", OUTLABEL(i));
+    if (!eqn_append(temp))
+      return NULL;
 
     col = strlen(OUTLABEL(i)) + 3;
     firstor = TRUE;
@@ -170,10 +195,15 @@ char *eqn_output(pPLA PLA) {
     /* Write product terms for each cube in this output */
     foreach_set(PLA->F, last,
                 p) if (is_in_set(p, i + cube.first_part[cube.output])) {
-      if (firstor)
-        strcat(output, "("), col += 1;
-      else
-        strcat(output, " | ("), col += 4;
+      if (firstor) {
+        if (!eqn_append("("))
+          return NULL;
+        col += 1;
+      } else {
+        if (!eqn_append(" | ("))
+          return NULL;
+        col += 4;
+      }
       firstor = FALSE;
       firstand = TRUE;
 
@@ -182,35 +212,32 @@ char *eqn_output(pPLA PLA) {
         if ((x = GETINPUT(p, var)) != DASH) {
           len = strlen(INLABEL(var));
           if (col + len > 72) {
-            strcat(output, "\n    ");
+            if (!eqn_append("\n    "))
+              return NULL;
             col = 4;
           }
           if (!firstand) {
-            strcat(output, "&");
+            if (!eqn_append("&"))
+              return NULL;
             col += 1;
           }
           firstand = FALSE;
           if (x == ZERO) {
-            strcat(output, "!");
+            if (!eqn_append("!"))
+              return NULL;
             col += 1;
           }
-          strcat(output, INLABEL(var));
+          if (!eqn_append(INLABEL(var)))
+            return NULL;
           col += len;
-          current_length += len + (x == ZERO ? 1 : 0) + (firstand ? 0 : 1);
-          // Check if buffer needs to be resized
-          if (current_length >= output_size) {
-            output_size *= 2;
-            output = (char *)realloc(output, output_size);
-            if (output == NULL) {
-              return NULL; // Memory reallocation failed
-            }
-          }
         }
       }
-      strcat(output, ")");
+      if (!eqn_append(")"))
+        return NULL;
       col += 1;
     }
-    strcat(output, ";\n\n");
+    if (!eqn_append(";\n\n"))
+      return NULL;
   }
   return output;
 }
