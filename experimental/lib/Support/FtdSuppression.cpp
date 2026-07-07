@@ -42,6 +42,7 @@
 #include "mlir/Dialect/MemRef/IR/MemRef.h"
 #include "mlir/IR/BuiltinOps.h"
 #include "mlir/Transforms/DialectConversion.h"
+#include "llvm/Support/FileSystem.h"
 using namespace mlir;
 using namespace dynamatic;
 using namespace dynamatic::experimental;
@@ -2015,6 +2016,90 @@ void ftd::insertDirectSuppression(mlir::OpBuilder &builder,
   // and every condition block the suppression will depend on.
   Block *dominatorBlock = producerBlock;
 
+  // --- Optional per-function log file (set FTD_LOG_DIR env var to enable) ---
+  std::unique_ptr<llvm::raw_fd_ostream> logOwner;
+  llvm::raw_ostream *log = nullptr;
+  if (const char *logDir = std::getenv("FTD_LOG_DIR")) {
+    std::string path =
+        std::string(logDir) + "/" + funcOp.getName().str() + "_ftd.log";
+    std::error_code ec;
+    logOwner = std::make_unique<llvm::raw_fd_ostream>(path, ec,
+                                                      llvm::sys::fs::OF_Append);
+    if (!ec)
+      log = logOwner.get();
+  }
+
+  auto blockName = [](const ftd::LocalCFG &cfg, Block *b) -> std::string {
+    if (!b)
+      return "(null)";
+    if (b == cfg.sinkBB)
+      return "sink";
+    if (b == cfg.secondVisitBB)
+      return "secondVisit";
+    auto it = cfg.origMap.find(b);
+    if (it != cfg.origMap.end() && it->second) {
+      std::string name;
+      llvm::raw_string_ostream ss(name);
+      it->second->printAsOperand(ss);
+      return ss.str();
+    }
+    std::string name;
+    llvm::raw_string_ostream ss(name);
+    b->printAsOperand(ss);
+    return "local(" + ss.str() + ")";
+  };
+
+  auto dumpLocalCFG = [&](const ftd::LocalCFG &cfg, llvm::StringRef name) {
+    if (!log)
+      return;
+    *log << "===== " << name << " =====\n";
+    *log << "  prod=" << blockName(cfg, cfg.newProd)
+         << "  cons=" << blockName(cfg, cfg.newCons)
+         << "  sink=" << blockName(cfg, cfg.sinkBB);
+    if (cfg.secondVisitBB)
+      *log << "  secondVisit=" << blockName(cfg, cfg.secondVisitBB);
+    *log << "\n  topo: ";
+    for (unsigned i = 0; i < cfg.topoOrder.size(); ++i) {
+      if (i > 0)
+        *log << " -> ";
+      *log << blockName(cfg, cfg.topoOrder[i]);
+    }
+    *log << "\n  edges:\n";
+    if (cfg.region) {
+      for (Block *b : cfg.topoOrder) {
+        Operation *term = b->getTerminator();
+        if (!term || term->getNumSuccessors() == 0)
+          continue;
+        std::string src = blockName(cfg, b);
+        if (auto condBr = dyn_cast<cf::CondBranchOp>(term)) {
+          *log << "    " << src << " -T-> "
+               << blockName(cfg, condBr.getTrueDest()) << ", -F-> "
+               << blockName(cfg, condBr.getFalseDest()) << "\n";
+        } else {
+          for (unsigned i = 0; i < term->getNumSuccessors(); ++i) {
+            *log << "    " << src << " -> "
+                 << blockName(cfg, term->getSuccessor(i)) << "\n";
+          }
+        }
+      }
+    }
+    *log << "\n";
+  };
+
+  if (log) {
+    *log << "[FTD] Producer block: ";
+    if (producerBlock)
+      producerBlock->printAsOperand(*log);
+    else
+      *log << "(null)";
+    *log << ", Consumer block: ";
+    if (consumerBlock)
+      consumerBlock->printAsOperand(*log);
+    else
+      *log << "(null)";
+    *log << "\n";
+  }
+
   // Account for the condition of a Mux only if it corresponds to a GAMMA GSA
   // gate
   bool deliverToGamma = llvm::isa<handshake::MuxOp>(consumer) &&
@@ -2134,6 +2219,13 @@ void ftd::insertDirectSuppression(mlir::OpBuilder &builder,
     }
   }
 
+  if (log && deliverToGamma) {
+    *log << "[FTD] Dominator block: ";
+    if (dominatorBlock)
+      dominatorBlock->printAsOperand(*log);
+    *log << "\n";
+  }
+
   // buildLocalCFGRegion builds a throwaway region used only for analysis; give
   // it its own builder so those temporary operations stay separate from the IR
   // we are actually editing (they are erased manually later).
@@ -2142,6 +2234,8 @@ void ftd::insertDirectSuppression(mlir::OpBuilder &builder,
   // as a producer block) and the consumer block.
   auto locGraph =
       buildLocalCFGRegion(tmpBuilder, dominatorBlock, consumerBlock, bi);
+
+  dumpLocalCFG(*locGraph, "locGraph (Dominator -> Consumer)");
 
   ControlDependenceAnalysis locCDA(*locGraph->region);
   // The condition blocks the consumer's reachability depends on, from the
@@ -2270,9 +2364,13 @@ void ftd::insertDirectSuppression(mlir::OpBuilder &builder,
       }
 
       if (nextMuxOp) {
+        if (log)
+          *log << "    -> Found Cascaded Gamma Mux\n";
         currentMuxOp = nextMuxOp;
       } else {
         isChainActive = false;
+        if (log)
+          *log << "    -> End of Gamma Mux Chain.\n";
       }
     }
   }
@@ -2330,6 +2428,8 @@ void ftd::insertDirectSuppression(mlir::OpBuilder &builder,
   auto fullDecisionGraph =
       buildDecisionGraph(*locGraph, locConsControlDepsFull);
 
+  dumpLocalCFG(*fullDecisionGraph, "fullDecisionGraph (locGraph + FullDeps)");
+
   // The decision graph may contain loops; this discovers their nesting so the
   // graph can later be peeled into acyclic, per-loop-level views.
   ftd::CyclicGraphManager cyclicMgr(*fullDecisionGraph);
@@ -2351,6 +2451,8 @@ void ftd::insertDirectSuppression(mlir::OpBuilder &builder,
   OpBuilder level0Builder(funcOp.getContext());
   auto level0CFG =
       cyclicMgr.extractLayeredCFG(cyclicMgr.getTopLevelScope(), level0Builder);
+
+  dumpLocalCFG(*level0CFG, "level0CFG (Acyclic Layered from fullDG)");
 
   // CDA on the acyclic level 0 CFG — allControlDeps == forwardControlDeps
   // because the graph is a DAG.
@@ -2391,6 +2493,8 @@ void ftd::insertDirectSuppression(mlir::OpBuilder &builder,
   // afterwards, on the separate constrained graph.
   auto level0FullDG = buildDecisionGraph(*level0CFG, level0Deps);
 
+  dumpLocalCFG(*level0FullDG, "level0FullDG (level0CFG + Deps)");
+
   // Variables produced inside loops live at a deeper loop-nesting level; demote
   // them down to level 0 ahead of time and cache them, so the routing and the
   // expression below consume the level-0 wires.
@@ -2406,6 +2510,20 @@ void ftd::insertDirectSuppression(mlir::OpBuilder &builder,
   auto level0ConstrainedDG =
       buildDecisionGraph(*level0CFG, level0Deps, level0MuxConstraints);
 
+  dumpLocalCFG(*level0ConstrainedDG,
+               "level0ConstrainedDG (level0CFG + muxConstraints)");
+
+  if (log && !muxConstraints.empty()) {
+    *log << "  muxConstraints (" << muxConstraints.size() << "):\n";
+    for (auto &entry : muxConstraints) {
+      *log << "    ";
+      if (entry.first)
+        entry.first->printAsOperand(*log);
+      *log << " requires " << (entry.second ? "TRUE" : "FALSE") << "\n";
+    }
+    *log << "\n";
+  }
+
   ControlDependenceAnalysis decCDA(*level0ConstrainedDG->region);
   DenseSet<Block *> constrainedDeps =
       decCDA.getAllBlockDeps()[level0ConstrainedDG->newCons].allControlDeps;
@@ -2416,8 +2534,12 @@ void ftd::insertDirectSuppression(mlir::OpBuilder &builder,
       enumeratePaths(*level0ConstrainedDG, bi, constrainedDeps);
 
   fCons = fCons->boolMinimize();
+  if (log)
+    *log << "fCons  = " << fCons->toString() << "\n";
   BoolExpression *fSup = fCons->boolNegate();
   fSup = fSup->boolMinimize();
+  if (log)
+    *log << "fSupmin  = " << fSup->toString() << "\n\n";
 
   // Build the circuit that computes, for a `start`->`target` stretch, the
   // expression under which the token must be discarded because it does not
@@ -2447,11 +2569,15 @@ void ftd::insertDirectSuppression(mlir::OpBuilder &builder,
       return Value();
     }
 
+    dumpLocalCFG(*locG, "locG (start -> target)");
+
     // Cyclic decision graph, then its level-0 (acyclic) reduction.
     ControlDependenceAnalysis locCDAlocal(*locG->region);
     DenseSet<Block *> depsTmp =
         locCDAlocal.getAllBlockDeps()[locG->newCons].allControlDeps;
     auto fullDG = buildDecisionGraph(*locG, depsTmp);
+
+    dumpLocalCFG(*fullDG, "fullDG (locG + deps)");
 
     CyclicGraphManager cyc(*fullDG);
     OpBuilder l0Builder(funcOp.getContext());
@@ -2462,6 +2588,8 @@ void ftd::insertDirectSuppression(mlir::OpBuilder &builder,
     DenseSet<Block *> l0Deps =
         l0CDA.getAllBlockDeps()[level0CFGlocal->newCons].allControlDeps;
     auto level0DG = buildDecisionGraph(*level0CFGlocal, l0Deps);
+
+    dumpLocalCFG(*level0DG, "level0DG (level0CFGlocal + deps)");
 
     ControlDependenceAnalysis dgCDA(*level0DG->region);
     DenseSet<Block *> dgDeps =
@@ -2478,6 +2606,8 @@ void ftd::insertDirectSuppression(mlir::OpBuilder &builder,
     BoolExpression *fConsLocal = enumeratePaths(*level0DG, bi, dgDeps);
     BoolExpression *fSupLocal =
         fConsLocal->boolMinimize()->boolNegate()->boolMinimize();
+    if (log)
+      *log << "fSupLocal = " << fSupLocal->toString() << "\n\n";
 
     Value result;
     if (fSupLocal->type != experimental::boolean::ExpressionType::Zero) {

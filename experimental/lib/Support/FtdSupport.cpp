@@ -13,6 +13,7 @@
 
 #include "experimental/Support/FtdSupport.h"
 #include "mlir/Dialect/ControlFlow/IR/ControlFlowOps.h"
+#include "mlir/IR/Dominance.h"
 #include "mlir/Transforms/DialectConversion.h"
 #include "llvm/ADT/TypeSwitch.h"
 #include <unordered_set>
@@ -39,8 +40,20 @@ ftd::BlockIndexing::BlockIndexing(Region &region) {
 
   // Sort the vector according to the dominance information, so that each
   // block comes after its dominators.
-  llvm::sort(allBlocks.begin(), allBlocks.end(),
-             [&](Block *a, Block *b) { return domInfo.dominates(a, b); });
+  //
+  // NOTE: the comparator passed to llvm::sort MUST be a strict weak ordering.
+  // `domInfo.dominates(a, b)` is only a partial order (blocks on distinct CFG
+  // branches are mutually incomparable), so using it directly is undefined
+  // behavior and produces a non-deterministic, inconsistent indexing. Instead
+  // we sort by the dominator tree's DFS in-number, which is a total order that
+  // still guarantees "a dominator precedes the blocks it dominates". DFS
+  // numbers are computed lazily, so refresh them before reading.
+  llvm::DominatorTreeBase<Block, /*IsPostDom=*/false> &domTree =
+      domInfo.getDomTree(&region);
+  domTree.updateDFSNumbers();
+  llvm::sort(allBlocks.begin(), allBlocks.end(), [&](Block *a, Block *b) {
+    return domTree.getNode(a)->getDFSNumIn() < domTree.getNode(b)->getDFSNumIn();
+  });
 
   // Associate a smaller index in the map to the blocks at higher levels of the
   // dominance tree

@@ -361,6 +361,17 @@ BoolExpression *BoolExpression::propagateNegation(bool negated) {
 std::string BoolExpression::runEspresso() {
   std::string espressoInput = "";
   std::set<std::string> vars = this->getVariables();
+  // [BOOL-LIB] Log the variable count. generateTruthTable() below allocates
+  // 2^(numVars) rows, and numOfRows is an `int`, so this is where an
+  // exponential blowup (or an int overflow at numVars>=31) would manifest as
+  // the munmap. Pure instrumentation.
+  llvm::errs() << "[BOOL-LIB] runEspresso: numVars=" << vars.size();
+  if (vars.size() < 31)
+    llvm::errs() << " (2^n rows=" << (1u << vars.size()) << ")";
+  else
+    llvm::errs() << " (2^n OVERFLOWS int !!)";
+  llvm::errs() << "\n";
+  llvm::errs().flush();
   // adding the number of inputs and outputs to the file
   espressoInput += (".i " + std::to_string(vars.size()) + "\n");
   espressoInput += ".o 1\n";
@@ -457,17 +468,48 @@ BoolExpression *BoolExpression::boolNegate() {
 }
 
 BoolExpression *BoolExpression::boolMinimize() {
+  // ---------------------------------------------------------------------------
+  // [BOOL-LIB] Crash-localization logging (unbuffered stderr, flushed per line).
+  // Pure instrumentation: no logic changed. Splits boolMinimize into its
+  // internal steps so the LAST line before an abort tells us whether the
+  // munmap happens in runEspresso, in parseSop, or on the returned pointer.
+  // The bracketed dump of the runEspresso result is the key datum: if it is
+  // "Failed to Minimize" we have confirmed the string-literal mismatch below
+  // (this function compares against lowercase "Failed to minimize", which never
+  // matches, so the error string is forwarded to parseSop as if it were a SOP).
+  // ---------------------------------------------------------------------------
+  llvm::errs() << "[BOOL-LIB] boolMinimize: calling runEspresso\n";
+  llvm::errs().flush();
   std::string espressoResult = this->runEspresso();
+  llvm::errs() << "[BOOL-LIB] boolMinimize: runEspresso returned: ["
+               << espressoResult << "]\n";
+  llvm::errs().flush();
   // if espresso fails, return the expression as is
-  if (espressoResult == "Failed to minimize")
+  if (espressoResult == "Failed to minimize") {
+    llvm::errs() << "[BOOL-LIB] boolMinimize: matched \"Failed to minimize\", "
+                    "returning this\n";
+    llvm::errs().flush();
     return this;
+  }
   // if espresso returns " ", then f = 0
-  if (espressoResult == " ")
+  if (espressoResult == " ") {
+    llvm::errs() << "[BOOL-LIB] boolMinimize: result is \" \", returning Zero\n";
+    llvm::errs().flush();
     return new BoolExpression(ExpressionType::Zero);
+  }
   // if espresso returns " ()", then f = 1
-  if (espressoResult == " ()")
+  if (espressoResult == " ()") {
+    llvm::errs() << "[BOOL-LIB] boolMinimize: result is \" ()\", returning One\n";
+    llvm::errs().flush();
     return new BoolExpression(ExpressionType::One);
-  return parseSop(espressoResult);
+  }
+  llvm::errs() << "[BOOL-LIB] boolMinimize: calling parseSop on the result\n";
+  llvm::errs().flush();
+  BoolExpression *parsed = parseSop(espressoResult);
+  llvm::errs() << "[BOOL-LIB] boolMinimize: parseSop returned "
+               << (parsed ? "non-null" : "NULL") << "\n";
+  llvm::errs().flush();
+  return parsed;
 }
 
 BoolExpression *BoolExpression::boolMinimizeSop() {

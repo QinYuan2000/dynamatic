@@ -34,9 +34,15 @@
 #include "mlir/IR/PatternMatch.h"
 #include "mlir/Support/LogicalResult.h"
 #include "mlir/Transforms/DialectConversion.h"
+#include "llvm/ADT/SmallString.h"
 #include "llvm/ADT/SmallVector.h"
+#include "llvm/ADT/Twine.h"
+#include "llvm/Support/FileSystem.h"
+#include "llvm/Support/raw_ostream.h"
 
+#include <cstdlib>
 #include <functional>
+#include <memory>
 #include <utility>
 
 // [START Boilerplate code for the MLIR pass]
@@ -54,6 +60,65 @@ using namespace dynamatic;
 using namespace dynamatic::experimental;
 using namespace dynamatic::experimental::boolean;
 using namespace dynamatic::experimental::ftd;
+
+// ---------------------------------------------------------------------------
+// Optional debug logging.
+//
+// When the FTD_LOG_DIR environment variable is set, each function appends to
+// "<FTD_LOG_DIR>/<func>_ftd.log" a record of the FTD pass phase boundaries.
+// Module-level phase boundaries (everything that happens before/around the
+// per-function conversion, e.g. CFG-topology capture, analysis construction,
+// and applyFullConversion) are written to "<FTD_LOG_DIR>/__module_ftd.log".
+//
+// Every line is flushed immediately AND mirrored to stderr (unbuffered), so if
+// the pass aborts (e.g. heap corruption) the LAST line that appears identifies
+// the phase that was running when the crash surfaced — even if the file
+// stream's heap-allocated buffers are unusable at abort time. The stderr mirror
+// also disambiguates the "empty log file" case: if FTD_LOG_DIR points somewhere
+// the process cannot write, openFtdLog now prints a warning to stderr and
+// logging continues on stderr only.
+// ---------------------------------------------------------------------------
+
+/// Returns true exactly once-per-process if FTD logging is requested via the
+/// FTD_LOG_DIR environment variable. When true, ftdLogStep mirrors every line
+/// to stderr regardless of whether the per-function/module file could be
+/// opened.
+static bool ftdLogEnabled() {
+  static const bool enabled = (std::getenv("FTD_LOG_DIR") != nullptr);
+  return enabled;
+}
+
+static std::unique_ptr<llvm::raw_fd_ostream> openFtdLog(StringRef funcName) {
+  const char *logDir = std::getenv("FTD_LOG_DIR");
+  if (!logDir)
+    return nullptr;
+  std::string path = std::string(logDir) + "/" + funcName.str() + "_ftd.log";
+  std::error_code ec;
+  auto os = std::make_unique<llvm::raw_fd_ostream>(path, ec,
+                                                   llvm::sys::fs::OF_Append);
+  if (ec) {
+    // Surface the path problem instead of silently dropping every log line.
+    llvm::errs() << "[FTD] WARNING: could not open log file '" << path
+                 << "': " << ec.message() << " (logging to stderr only)\n";
+    llvm::errs().flush();
+    return nullptr;
+  }
+  return os;
+}
+
+static void ftdLogStep(llvm::raw_ostream *log, const llvm::Twine &msg) {
+  if (log) {
+    *log << msg << "\n";
+    log->flush();
+  }
+  // Mirror to stderr when logging is enabled. errs() is unbuffered and
+  // allocation-light, so it survives a corrupted heap better than the file
+  // stream and is visible in the terminal right before an abort.
+  if (ftdLogEnabled()) {
+    llvm::errs() << "[FTD] " << msg << "\n";
+    llvm::errs().flush();
+  }
+}
 
 struct AllocaOpConversion : public DynOpConversionPattern<memref::AllocaOp> {
   using DynOpConversionPattern<memref::AllocaOp>::DynOpConversionPattern;
@@ -170,16 +235,24 @@ struct OriginalCFGInfo {
 /// Walk every func::FuncOp in the module and capture its CFG topology.
 /// Must be called BEFORE applyFullConversion.
 static DenseMap<StringRef, OriginalCFGInfo>
-captureAllCFGTopologies(ModuleOp moduleOp) {
+captureAllCFGTopologies(ModuleOp moduleOp, llvm::raw_ostream *log) {
   DenseMap<StringRef, OriginalCFGInfo> result;
 
+  ftdLogStep(log, "[capture] start");
+
   for (auto funcOp : moduleOp.getOps<func::FuncOp>()) {
-    if (funcOp.isExternal() || funcOp.getSymName().startswith("__init"))
+    ftdLogStep(log, "[capture] visiting func: " + funcOp.getSymName());
+
+    if (funcOp.isExternal() || funcOp.getSymName().startswith("__init")) {
+      ftdLogStep(log, "[capture]   skipped (external/__init)");
       continue;
+    }
 
     Region &region = funcOp.getBody();
-    if (region.empty())
+    if (region.empty()) {
+      ftdLogStep(log, "[capture]   skipped (empty region)");
       continue;
+    }
 
     OriginalCFGInfo info;
 
@@ -189,10 +262,14 @@ captureAllCFGTopologies(ModuleOp moduleOp) {
 
     info.numBlocks = blockIdx.size();
     info.blockEdges.resize(info.numBlocks);
+    ftdLogStep(log, "[capture]   numBlocks=" + llvm::Twine(info.numBlocks));
 
     for (auto &[block, idx] : blockIdx) {
       BlockEdgeInfo &edge = info.blockEdges[idx];
       Operation *term = block->getTerminator();
+      ftdLogStep(log, "[capture]   block idx=" + llvm::Twine(idx) +
+                          " term=" + (term ? term->getName().getStringRef()
+                                           : llvm::StringRef("<null>")));
 
       if (auto condBr = dyn_cast<cf::CondBranchOp>(term)) {
         edge.isConditional = true;
@@ -205,8 +282,12 @@ captureAllCFGTopologies(ModuleOp moduleOp) {
       }
     }
 
+    ftdLogStep(log, "[capture]   recording topology for " + funcOp.getSymName());
     result[funcOp.getSymName()] = std::move(info);
   }
+
+  ftdLogStep(log, "[capture] done (funcs recorded=" +
+                      llvm::Twine(result.size()) + ")");
 
   return result;
 }
@@ -215,9 +296,13 @@ captureAllCFGTopologies(ModuleOp moduleOp) {
 /// captured before conversion.
 static ftd::ShadowCFG buildShadowCFG(OpBuilder &builder,
                                      handshake::FuncOp realFuncOp,
-                                     const OriginalCFGInfo &info) {
+                                     const OriginalCFGInfo &info,
+                                     llvm::raw_ostream *log) {
   ftd::ShadowCFG shadow;
   Location loc = realFuncOp.getLoc();
+
+  ftdLogStep(log, "[shadow]   buildShadowCFG start (numBlocks=" +
+                      llvm::Twine(info.numBlocks) + ")");
 
   // 1. Create a temporary func::FuncOp with blocks + CF terminators
   {
@@ -226,11 +311,14 @@ static ftd::ShadowCFG buildShadowCFG(OpBuilder &builder,
     auto funcType = builder.getFunctionType({}, {});
     shadow.shadowFunc =
         builder.create<func::FuncOp>(loc, "__ftd_shadow_cfg__", funcType);
+    ftdLogStep(log, "[shadow]   shadow func created");
 
     Region &R = shadow.shadowFunc.getBody();
     SmallVector<Block *> blocks;
     for (unsigned i = 0; i < info.numBlocks; ++i)
       blocks.push_back(builder.createBlock(&R, R.end()));
+    ftdLogStep(log, "[shadow]   created " + llvm::Twine(blocks.size()) +
+                        " shadow blocks");
 
     for (unsigned i = 0; i < info.numBlocks; ++i) {
       const BlockEdgeInfo &edge = info.blockEdges[i];
@@ -248,6 +336,7 @@ static ftd::ShadowCFG buildShadowCFG(OpBuilder &builder,
         builder.create<func::ReturnOp>(loc);
       }
     }
+    ftdLogStep(log, "[shadow]   wired shadow terminators");
   }
 
   // 2. Scan the real funcOp to map BB index -> real condition Value
@@ -261,6 +350,8 @@ static ftd::ShadowCFG buildShadowCFG(OpBuilder &builder,
     if (!shadow.conditionMap.contains(bbIdx))
       shadow.conditionMap[bbIdx] = brOp.getConditionOperand();
   });
+  ftdLogStep(log, "[shadow]   condition scan done (conditions=" +
+                      llvm::Twine(shadow.conditionMap.size()) + ")");
 
   return shadow;
 }
@@ -275,17 +366,57 @@ struct FtdCfToHandshakePass
     MLIRContext *ctx = &getContext();
     ModuleOp modOp = getOperation();
 
+    // Module-level log: covers everything that happens before/around the
+    // per-function conversion. Opened first so the very first steps (topology
+    // capture, analysis construction) are recorded. ftdLogStep also mirrors to
+    // stderr, so even if this file cannot be opened the steps are still visible.
+    auto mlogOwner = openFtdLog("__module");
+    llvm::raw_ostream *mlog = mlogOwner.get();
+
+    {
+      SmallString<256> cwd;
+      std::error_code cwdEc = llvm::sys::fs::current_path(cwd);
+      const char *logDir = std::getenv("FTD_LOG_DIR");
+      ftdLogStep(mlog, "[pass] ==== FtdCfToHandshakePass::runDynamaticPass ====");
+      ftdLogStep(mlog, llvm::Twine("[pass] cwd=") +
+                           (cwdEc ? llvm::StringRef("<unknown>")
+                                  : llvm::StringRef(cwd)));
+      ftdLogStep(mlog, llvm::Twine("[pass] FTD_LOG_DIR=") +
+                           (logDir ? logDir : "<unset>"));
+    }
+
     CfToHandshakeTypeConverter converter;
     RewritePatternSet patterns(ctx);
 
     // Capture CFG topology before conversion flattens everything.
-    auto cfgTopologies = captureAllCFGTopologies(modOp);
+    ftdLogStep(mlog, "[pass] captureAllCFGTopologies: call");
+    auto cfgTopologies = captureAllCFGTopologies(modOp, mlog);
+    ftdLogStep(mlog, "[pass] captureAllCFGTopologies: returned");
 
+    // Pre-touch the analyses individually so that, if one of them is the source
+    // of the crash, the log pinpoints which. getAnalysis<> caches its result in
+    // the AnalysisManager, so the patterns.add<> call below reuses these exact
+    // instances; this only fixes the (otherwise unspecified) construction order
+    // and moves it a few lines earlier — it does not change what is computed.
+    ftdLogStep(mlog, "[pass] getAnalysis<ControlDependenceAnalysis>: start");
+    (void)getAnalysis<ControlDependenceAnalysis>();
+    ftdLogStep(mlog, "[pass] getAnalysis<ControlDependenceAnalysis>: done");
+
+    ftdLogStep(mlog, "[pass] getAnalysis<gsa::GSAAnalysis>: start");
+    (void)getAnalysis<gsa::GSAAnalysis>();
+    ftdLogStep(mlog, "[pass] getAnalysis<gsa::GSAAnalysis>: done");
+
+    ftdLogStep(mlog, "[pass] getAnalysis<NameAnalysis>: start");
+    (void)getAnalysis<NameAnalysis>();
+    ftdLogStep(mlog, "[pass] getAnalysis<NameAnalysis>: done");
+
+    ftdLogStep(mlog, "[pass] building FtdLowerFuncToHandshake pattern");
     patterns.add<experimental::ftd::FtdLowerFuncToHandshake>(
         getAnalysis<ControlDependenceAnalysis>(),
         getAnalysis<gsa::GSAAnalysis>(), getAnalysis<NameAnalysis>(), converter,
         ctx);
 
+    ftdLogStep(mlog, "[pass] building one-to-one conversion patterns");
     patterns.add<
         // LowerFuncToHandshake,
         /*ConvertConstants,*/ AllocaOpConversion, ConvertCalls,
@@ -325,6 +456,7 @@ struct FtdCfToHandshakePass
         OneToOneConversion<arith::ExtFOp, handshake::ExtFOp>,
         OneToOneConversion<math::AbsFOp, handshake::AbsFOp>>(
         getAnalysis<NameAnalysis>(), converter, ctx);
+    ftdLogStep(mlog, "[pass] patterns built");
 
     // All func-level functions must become handshake-level functions
     ConversionTarget target(*ctx);
@@ -351,12 +483,17 @@ struct FtdCfToHandshakePass
     target.addDynamicallyLegalOp<func::FuncOp>(
         [](func::FuncOp op) { return op.getSymName().startswith("__init"); });
 
-    if (failed(applyFullConversion(modOp, target, std::move(patterns))))
+    ftdLogStep(mlog, "[pass] applyFullConversion: start");
+    if (failed(applyFullConversion(modOp, target, std::move(patterns)))) {
+      ftdLogStep(mlog, "[pass] applyFullConversion: FAILED (signalPassFailure)");
       return signalPassFailure();
+    }
+    ftdLogStep(mlog, "[pass] applyFullConversion: done");
 
     // Clean up: Remove the definition of each __init* function, but only if it
     // has no remaining uses. This is safe because all valid calls to __init*
     // were tracked and deleted earlier.
+    ftdLogStep(mlog, "[pass] __init cleanup: start");
     for (auto func : llvm::make_early_inc_range(modOp.getOps<func::FuncOp>())) {
       if (func.getSymName().startswith("__init")) {
         assert(func.use_empty() &&
@@ -364,20 +501,36 @@ struct FtdCfToHandshakePass
         func.erase();
       }
     }
+    ftdLogStep(mlog, "[pass] __init cleanup: done");
 
+    ftdLogStep(mlog, "[pass] post-conversion FTD loop: start");
     for (auto funcOp : modOp.getOps<handshake::FuncOp>()) {
       mlir::OpBuilder builder(funcOp.getContext());
 
       auto topoIt = cfgTopologies.find(funcOp.getName());
-      if (topoIt == cfgTopologies.end())
+      if (topoIt == cfgTopologies.end()) {
+        ftdLogStep(mlog, "[pass]   func " + funcOp.getName() +
+                             ": no topology, skipping");
         continue;
+      }
       const OriginalCFGInfo &info = topoIt->second;
 
-      if (info.numBlocks <= 1)
+      if (info.numBlocks <= 1) {
+        ftdLogStep(mlog, "[pass]   func " + funcOp.getName() +
+                             ": numBlocks<=1, skipping");
         continue;
+      }
+
+      ftdLogStep(mlog, "[pass]   func " + funcOp.getName() + ": processing");
+
+      auto logOwner = openFtdLog(funcOp.getName());
+      llvm::raw_ostream *log = logOwner.get();
+      ftdLogStep(log, "[cf2hs] ==== post-conversion FTD: " + funcOp.getName() +
+                          " (blocks=" + llvm::Twine(info.numBlocks) + ") ====");
 
       // Build the shadow CFG — one struct, everything inside.
-      ftd::ShadowCFG shadow = buildShadowCFG(builder, funcOp, info);
+      ftd::ShadowCFG shadow = buildShadowCFG(builder, funcOp, info, log);
+      ftdLogStep(log, "[cf2hs] buildShadowCFG done");
 
       // Route the select of every conditional block's terminator branch
       // through that block's condition placeholder.
@@ -388,6 +541,8 @@ struct FtdCfToHandshakePass
         if (auto bbAttr = cstOp->getAttrOfType<IntegerAttr>("handshake.bb"))
           condPlaceholderByBB[bbAttr.getUInt()] = cstOp.getResult();
       }
+      ftdLogStep(log, "[cf2hs] collected cond placeholders (count=" +
+                          llvm::Twine(condPlaceholderByBB.size()) + ")");
       for (auto brOp : funcOp.getOps<handshake::ConditionalBranchOp>()) {
         if (brOp->hasAttr("ftd.skip"))
           continue;
@@ -400,8 +555,10 @@ struct FtdCfToHandshakePass
         // operand 0 of a ConditionalBranchOp is the condition (select).
         brOp->setOperand(0, it->second);
       }
+      ftdLogStep(log, "[cf2hs] cond placeholder routing done");
 
       ftd::resolveCondPlaceholders(funcOp, builder, shadow);
+      ftdLogStep(log, "[cf2hs] resolveCondPlaceholders done");
 
       // Populate conditionMap from NotIOp placeholders
       for (auto notOp : funcOp.getOps<handshake::NotIOp>()) {
@@ -412,13 +569,26 @@ struct FtdCfToHandshakePass
           continue;
         shadow.conditionMap[bbAttr.getUInt()] = notOp.getResult();
       }
+      ftdLogStep(log, "[cf2hs] conditionMap populated");
 
+      ftdLogStep(log, "[cf2hs] addRegen start");
       ftd::addRegen(funcOp, builder, shadow);
+      ftdLogStep(log, "[cf2hs] addRegen done");
+
+      ftdLogStep(log, "[cf2hs] addSupp start");
       ftd::addSupp(funcOp, builder, shadow);
+      ftdLogStep(log, "[cf2hs] addSupp done");
+
       ftd::finalizeCondPlaceholders(funcOp);
+      ftdLogStep(log, "[cf2hs] finalizeCondPlaceholders done");
 
       shadow.destroy();
+      ftdLogStep(log, "[cf2hs] shadow.destroy done");
+
+      ftdLogStep(mlog, "[pass]   func " + funcOp.getName() + ": done");
     }
+    ftdLogStep(mlog, "[pass] post-conversion FTD loop: done");
+    ftdLogStep(mlog, "[pass] ==== runDynamaticPass complete ====");
   }
 };
 } // namespace
@@ -543,6 +713,10 @@ using ArgReplacements = DenseMap<BlockArgument, OpResult>;
 LogicalResult ftd::FtdLowerFuncToHandshake::matchAndRewrite(
     func::FuncOp lowerFuncOp, OpAdaptor /*adaptor*/,
     ConversionPatternRewriter &rewriter) const {
+  auto logOwner = openFtdLog(lowerFuncOp.getSymName());
+  llvm::raw_ostream *log = logOwner.get();
+  ftdLogStep(log, "[cf2hs] >>> matchAndRewrite: " + lowerFuncOp.getSymName());
+
   // Map all memory accesses in the matched function to the index of their
   // memref in the function's arguments
   DenseMap<Value, unsigned> memrefToArgIdx;
@@ -550,8 +724,11 @@ LogicalResult ftd::FtdLowerFuncToHandshake::matchAndRewrite(
     if (isa<mlir::MemRefType>(arg.getType()))
       memrefToArgIdx.insert({arg, idx});
   }
+  ftdLogStep(log, "[cf2hs] memrefToArgIdx built (memrefs=" +
+                      llvm::Twine(memrefToArgIdx.size()) + ")");
 
   ftd::createAllCondPlaceholders(lowerFuncOp.getRegion(), rewriter);
+  ftdLogStep(log, "[cf2hs] createAllCondPlaceholders done");
 
   // Structure used inside addGsaGates to temporarily map a cf value to a
   // backedge until the proper handshake values are created; in which case, the
@@ -565,17 +742,26 @@ LogicalResult ftd::FtdLowerFuncToHandshake::matchAndRewrite(
   BackedgeBuilder edgeBuilderStart(rewriter, lowerFuncOp.getRegion().getLoc());
   Backedge startValueBackedge =
       edgeBuilderStart.get(rewriter.getType<handshake::ControlType>());
+  ftdLogStep(log, "[cf2hs] addGsaGates start");
   if (failed(addGsaGates(lowerFuncOp.getRegion(), rewriter, gsaAnalysis,
-                         startValueBackedge, &pendingMuxOperands)))
+                         startValueBackedge, &pendingMuxOperands))) {
+    ftdLogStep(log, "[cf2hs] addGsaGates FAILED");
     return failure();
+  }
+  ftdLogStep(log, "[cf2hs] addGsaGates done");
 
   // First lower the parent function itself, without modifying its body
   auto funcOrFailure = lowerSignature(lowerFuncOp, rewriter);
-  if (failed(funcOrFailure))
+  if (failed(funcOrFailure)) {
+    ftdLogStep(log, "[cf2hs] lowerSignature FAILED");
     return failure();
+  }
   handshake::FuncOp funcOp = *funcOrFailure;
-  if (funcOp.isExternal())
+  if (funcOp.isExternal()) {
+    ftdLogStep(log, "[cf2hs] funcOp external, early success");
     return success();
+  }
+  ftdLogStep(log, "[cf2hs] lowerSignature done");
 
   // When GSA-MU functions are translated into multiplexers, an `init merge`
   // is created to feed them. This merge requires the start value of the
@@ -592,6 +778,7 @@ LogicalResult ftd::FtdLowerFuncToHandshake::matchAndRewrite(
       be.setValue(newVal);
   }
   pendingMuxOperands.clear();
+  ftdLogStep(log, "[cf2hs] GSA mux operands resolved");
 
   // Stores mapping from each value that passes through a merge-like
   // operation to the data result of that merge operation
@@ -604,7 +791,9 @@ LogicalResult ftd::FtdLowerFuncToHandshake::matchAndRewrite(
   // argument but because we removed all "real" arguments, we are only left
   // with the Start value as an argument for every block
   addMergeOps(funcOp, rewriter, argReplacements);
+  ftdLogStep(log, "[cf2hs] addMergeOps done");
   addBranchOps(funcOp, rewriter);
+  ftdLogStep(log, "[cf2hs] addBranchOps done");
 
   // addBranchOps only creates handshake::ConditionalBranchOp for live-out
   // values.  If a conditional block has no live-outs, no ConditionalBranchOp
@@ -629,41 +818,58 @@ LogicalResult ftd::FtdLowerFuncToHandshake::matchAndRewrite(
                                                       ctrl);
     }
   }
+  ftdLogStep(log, "[cf2hs] cond-branch fixup done");
 
   // The memory operations are converted to the corresponding handshake
   // counterparts. No LSQ interface is created yet.
   BackedgeBuilder edgeBuilder(rewriter, funcOp->getLoc());
   LowerFuncToHandshake::MemInterfacesInfo memInfo;
   if (failed(convertMemoryOps(funcOp, rewriter, memrefToArgIdx, edgeBuilder,
-                              memInfo)))
+                              memInfo))) {
+    ftdLogStep(log, "[cf2hs] convertMemoryOps FAILED");
     return failure();
+  }
+  ftdLogStep(log, "[cf2hs] convertMemoryOps done");
 
   // First round of bb-tagging so that newly inserted Dynamatic memory ports
   // get tagged with the BB they belong to (required by memory interface
   // instantiation logic)
   idBasicBlocks(funcOp, rewriter);
+  ftdLogStep(log, "[cf2hs] idBasicBlocks #1 done");
 
   // Create the memory interface according to the algorithm from FPGA'23. This
   // functions introduce new data dependencies that are then passed to FTD for
   // correctly delivering data between them like any real data dependencies
-  if (failed(verifyAndCreateMemInterfaces(funcOp, rewriter, memInfo)))
+  if (failed(verifyAndCreateMemInterfaces(funcOp, rewriter, memInfo))) {
+    ftdLogStep(log, "[cf2hs] verifyAndCreateMemInterfaces FAILED");
     return failure();
+  }
+  ftdLogStep(log, "[cf2hs] verifyAndCreateMemInterfaces done");
 
   // Convert the constants and undefined values from the `arith` dialect to
   // the `handshake` dialect, while also using the start value as their
   // control value
   if (failed(convertConstants(rewriter, funcOp, namer)) ||
-      failed(convertUndefinedValues(rewriter, funcOp, namer)))
+      failed(convertUndefinedValues(rewriter, funcOp, namer))) {
+    ftdLogStep(log, "[cf2hs] constants/undef conversion FAILED");
     return failure();
+  }
+  ftdLogStep(log, "[cf2hs] constants/undef converted");
 
   // id basic block
   idBasicBlocks(funcOp, rewriter);
+  ftdLogStep(log, "[cf2hs] idBasicBlocks #2 done");
 
   // Annotate the IR with the CFG information
   cfg::annotateCFG(funcOp, rewriter, namer);
+  ftdLogStep(log, "[cf2hs] annotateCFG done");
 
-  if (failed(flattenAndTerminate(funcOp, rewriter, argReplacements)))
+  if (failed(flattenAndTerminate(funcOp, rewriter, argReplacements))) {
+    ftdLogStep(log, "[cf2hs] flattenAndTerminate FAILED");
     return failure();
+  }
+  ftdLogStep(log, "[cf2hs] flattenAndTerminate done");
 
+  ftdLogStep(log, "[cf2hs] <<< matchAndRewrite done");
   return success();
 }
