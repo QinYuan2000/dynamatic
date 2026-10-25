@@ -96,9 +96,8 @@ void experimental::gsa::GSAAnalysis::convertSSAToGSAMerges(
   convertPhiToMu(region, bi);
   convertPhiToGamma(region, bi);
 
-  // After the conversion is done, `gatesPerBlock` will contain some phis, some
-  // MUs and some GAMMAs. Since we are only interested in the last two, we can
-  // remove all the phis.
+  // Remove phis that have been replaced by MU/GAMMA gates. Single-input phi
+  // roots are retained as passthroughs and need no condition.
   removePhiGates();
   printAllGates();
 }
@@ -404,9 +403,8 @@ void experimental::gsa::GSAAnalysis::convertSSAToGSA(Region &region) {
   convertPhiToMu(region, bi);
   convertPhiToGamma(region, bi);
 
-  // After the conversion is done, `gatesPerBlock` will contain some phis, some
-  // MUs and some GAMMAs. Since we are only interested in the last two, we can
-  // remove all the phis.
+  // Remove phis that have been replaced by MU/GAMMA gates. Single-input phi
+  // roots are retained as passthroughs and need no condition.
   removePhiGates();
   printAllGates();
 }
@@ -427,6 +425,13 @@ void experimental::gsa::GSAAnalysis::convertPhiToGamma(
       // Skip if the phi is not of type `Phi`
       if (phi->gsaGateFunction != PhiGate)
         continue;
+
+      // Equal incoming values can collapse a phi to one input. Preserve it as
+      // a passthrough root: no predicate exists to expand in this case.
+      if (phi->operands.size() == 1) {
+        phi->isRoot = true;
+        continue;
+      }
 
       // Sort the operands of the phi in block order, so that Bi comes before Bj
       // if Bj can be reached from Bi without going through a backedge (which
@@ -681,12 +686,12 @@ void experimental::gsa::GSAAnalysis::convertPhiToMu(Region &region,
 void experimental::gsa::GSAAnalysis::removePhiGates() {
   for (auto const &[block, gates] : gatesPerBlock) {
 
-    // New vector of gates, which will contain only gamms and mus
+    // Keep MU/GAMMA gates and single-input passthrough roots.
     SmallVector<Gate *> gatesWithoutPhis;
     for (Gate *g : gates) {
-      // Delete the gate in case of a phi, otherwise keep it and insert it in
+      // Delete a replaced phi, otherwise keep the gate and insert it in
       // the new list.
-      if (g->gsaGateFunction == GateType::PhiGate)
+      if (g->gsaGateFunction == GateType::PhiGate && !g->isRoot)
         delete g;
       else
         gatesWithoutPhis.push_back(g);

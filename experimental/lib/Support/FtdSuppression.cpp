@@ -328,7 +328,8 @@ CyclicGraphManager::extractLayeredCFG(const LoopScope *scope,
           &block == newGraph->sinkBB)
         continue;
 
-      Operation *term = block.getTerminator();
+      Operation *term =
+          block.mightHaveTerminator() ? block.getTerminator() : nullptr;
 
       // Dead block removal (applies to all levels).
       // A block without a terminator has no outgoing edges and is dead.
@@ -400,6 +401,16 @@ CyclicGraphManager::extractLayeredCFG(const LoopScope *scope,
     }
   }
 
+  // A reduced layer may start at a terminal, or lose all outgoing paths.
+  // Preserve a consumer entry as true; a sink or dead entry is false.
+  if (!newGraph->newProd->mightHaveTerminator()) {
+    bool startsAtConsumer = scope->level == 0 &&
+                            scope->header == lcfg.newCons &&
+                            scope->header != lcfg.sinkBB;
+    builder.setInsertionPointToEnd(newGraph->newProd);
+    builder.create<cf::BranchOp>(loc, startsAtConsumer ? trueTerm : falseTerm);
+  }
+
   // Compute topological order starting from the producer.
   DenseSet<Block *> visited;
   std::function<void(Block *)> topo = [&](Block *u) {
@@ -422,8 +433,11 @@ CyclicGraphManager::extractLayeredCFG(const LoopScope *scope,
   // region.front() is the entry.
   for (Block &block : llvm::make_early_inc_range(R)) {
     if (!visited.contains(&block)) {
+      if (&block == newGraph->newCons)
+        newGraph->newCons = newGraph->sinkBB;
       // Erase the terminator first to drop outgoing BlockOperand refs.
-      if (Operation *term = block.getTerminator())
+      if (Operation *term =
+              block.mightHaveTerminator() ? block.getTerminator() : nullptr)
         term->erase();
       // The orphan is unreachable, so no other terminator references it.
       block.erase();
@@ -624,6 +638,10 @@ getHybridPathExpression(const std::vector<Block *> &localPath,
 BoolExpression *ftd::enumeratePaths(const ftd::LocalCFG &lcfg,
                                     const ftd::BlockIndexing &bi,
                                     const DenseSet<Block *> &controlDeps) {
+
+  // The sink is never a delivery, including a layer with no reachable exit.
+  if (lcfg.newCons == lcfg.sinkBB)
+    return BoolExpression::boolZero();
 
   // 1. Path Finding using Iterative DFS (on Local CFG)
   std::vector<std::vector<Block *>> allPaths;
@@ -904,7 +922,7 @@ static Value generateReachabilityLogic(
               return bi.isLess(idA.value(), idB.value());
             });
 
-  BDD *bdd = buildBDD(fSuppress, cofactorList);
+  BDD *bdd = ftd::buildRoutingBDD(fSuppress, cofactorList);
 
   // Note: bddToCircuit uses registry.lookup. If the suppression logic involves
   // variables distributed earlier (like c3a), it will correctly find them.
@@ -1208,7 +1226,7 @@ Value ftd::expressionToCircuit(
   for (auto &p : tmp)
     cofactorList.push_back(p.second);
 
-  BDD *bdd = buildBDD(expr, cofactorList);
+  BDD *bdd = ftd::buildRoutingBDD(expr, cofactorList);
   return bddToCircuit(builder, bdd, insertBlock, registry, {}, bi,
                       pendingMuxOperands, shadow, forcedBBAttr);
 }
